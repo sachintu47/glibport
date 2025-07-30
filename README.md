@@ -2,7 +2,7 @@
 
 # glib
 
-"Core application library for C
+Core application library for C
 
 # Installation and Usage
 
