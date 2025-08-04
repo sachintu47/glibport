@@ -1,0 +1,175 @@
+diff --git a/gio/gapplicationcommandline.c b/gio/gapplicationcommandline.c
+index 78db55b..8f32d6c 100644
+--- a/gio/gapplicationcommandline.c
++++ b/gio/gapplicationcommandline.c
+@@ -39,6 +39,8 @@
+ #include "gwin32inputstream.h"
+ #endif
+ 
++#undef environ
++
+ /**
+  * GApplicationCommandLine:
+  *
+diff --git a/gio/glocalfileinfo.c b/gio/glocalfileinfo.c
+index 8d7831f..c24d58a 100644
+--- a/gio/glocalfileinfo.c
++++ b/gio/glocalfileinfo.c
+@@ -1186,7 +1186,7 @@ lookup_uid_data (uid_t uid)
+       if (pwbufp->pw_name != NULL && pwbufp->pw_name[0] != 0)
+ 	data->user_name = convert_pwd_string_to_utf8 (pwbufp->pw_name);
+ 
+-#ifndef __BIONIC__
++#if !defined(__BIONIC__) && !defined(__MVS__)
+       gecos = pwbufp->pw_gecos;
+ 
+       if (gecos)
+diff --git a/gio/gresolver.c b/gio/gresolver.c
+index 60fbb4b..2e427a8 100644
+--- a/gio/gresolver.c
++++ b/gio/gresolver.c
+@@ -41,6 +41,7 @@
+ 
+ #include <stdlib.h>
+ 
++#include <arpa/inet.h>
+ 
+ /**
+  * GResolver:
+diff --git a/gio/gsocket.c b/gio/gsocket.c
+index 0a2a523..7719d4a 100644
+--- a/gio/gsocket.c
++++ b/gio/gsocket.c
+@@ -82,6 +82,8 @@
+ #include "giowin32-afunix.h"
+ #endif
+ 
++#include <xti.h>
++
+ /**
+  * GSocket:
+  *
+diff --git a/gio/gthreadedresolver.c b/gio/gthreadedresolver.c
+index 988015b..357dc82 100644
+--- a/gio/gthreadedresolver.c
++++ b/gio/gthreadedresolver.c
+@@ -41,6 +41,8 @@
+ #include "gsocketaddress.h"
+ #include "gsrvtarget.h"
+ 
++#define HAVE_GETIFADDRS 0
++
+ #if HAVE_GETIFADDRS
+ #include <ifaddrs.h>
+ #endif
+diff --git a/gio/meson.build b/gio/meson.build
+index 20a22aa..50cf981 100644
+--- a/gio/meson.build
++++ b/gio/meson.build
+@@ -776,22 +776,22 @@ install_headers(gio_headers, install_dir : gio_includedir)
+ # in PATH, which means you can't bootstrap glib with its own glib-mkenums.
+ gioenumtypes_h = custom_target('gioenumtypes_h',
+   output : 'gioenumtypes.h',
+-  capture : true,
++  capture : false,
+   input : gio_headers,
+   install : true,
+   install_dir : gio_includedir,
+   command : [python, glib_mkenums,
+              '--template', files('gioenumtypes.h.template'),
+-             '@INPUT@', gnetworking_h])
++             '--output', '@OUTPUT@', '@INPUT@', gnetworking_h])
+ 
+ gioenumtypes_c = custom_target('gioenumtypes_c',
+   output : 'gioenumtypes.c',
+-  capture : true,
++  capture : false,
+   input : gio_headers,
+   depends : [gioenumtypes_h],
+   command : [python, glib_mkenums,
+              '--template', files('gioenumtypes.c.template'),
+-             '@INPUT@', gnetworking_h])
++             '--output', '@OUTPUT@', '@INPUT@', gnetworking_h])
+ 
+ gioenumtypes_dep = declare_dependency(sources : [gioenumtypes_h, glib_enumtypes_h, gio_visibility_h])
+ 
+diff --git a/glib/gutils.c b/glib/gutils.c
+index 9c0fbdf..ff1fd9f 100644
+--- a/glib/gutils.c
++++ b/glib/gutils.c
+@@ -734,7 +734,7 @@ g_get_user_database_entry (void)
+           {
+             e.user_name = g_strdup (pw->pw_name);
+ 
+-#ifndef __BIONIC__
++#if !defined(__BIONIC__) && !defined(__MVS__)
+             if (pw->pw_gecos && *pw->pw_gecos != '\0' && pw->pw_name)
+               {
+                 gchar **gecos_fields;
+diff --git a/gobject/meson.build b/gobject/meson.build
+index 91823af..6470af2 100644
+--- a/gobject/meson.build
++++ b/gobject/meson.build
+@@ -116,23 +116,23 @@ glib_enumtypes_input_headers = files(
+ 
+ glib_enumtypes_h = custom_target('glib_enumtypes_h',
+   output : 'glib-enumtypes.h',
+-  capture : true,
++  capture : false,
+   input : glib_enumtypes_input_headers,
+   install : true,
+   install_dir : join_paths(get_option('includedir'), 'glib-2.0/gobject'),
+   install_tag: 'devel',
+   command : [python, glib_mkenums,
+              '--template', files('glib-enumtypes.h.template'),
+-             '@INPUT@'])
++             '--output', '@OUTPUT@', '@INPUT@'])
+ 
+ glib_enumtypes_c = custom_target('glib_enumtypes_c',
+   output : 'glib-enumtypes.c',
+-  capture : true,
++  capture : false,
+   input : glib_enumtypes_input_headers,
+   depends : [glib_enumtypes_h],
+   command : [python, glib_mkenums,
+              '--template', files('glib-enumtypes.c.template'),
+-             '@INPUT@'])
++             '--output', '@OUTPUT@', '@INPUT@'])
+ 
+ # Expose as variable to be used by gobject-introspection
+ # when it includes GLib as a subproject
+diff --git a/meson.build b/meson.build
+index ba401be..2168bb6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -18,12 +18,12 @@ fs = import('fs')
+ cc = meson.get_compiler('c')
+ c_standards = {}
+ 
+-foreach std : ['89', '99', '11', '17']
+-  arg = (cc.get_id() == 'msvc' ? '/std:' : '-std=') + 'c' + std
+-  if cc.has_argument(arg)
+-    c_standards += { std: arg }
+-  endif
+-endforeach
++#foreach std : ['89', '99', '11', '17']
++#  arg = (cc.get_id() == 'msvc' ? '/std:' : '-std=') + 'c' + std
++#  if cc.has_argument(arg)
++#    c_standards += { std: arg }
++#  endif
++#endforeach
+ 
+ # In the 2.85 cycle, this soft-dependency on C11 will become a hard dependency.
+ # If this is a problem on your toolchain or platform, please file an issue
+diff --git a/subprojects/libffi.wrap b/subprojects/libffi.wrap
+index a8a23bb..c67a9e8 100644
+--- a/subprojects/libffi.wrap
++++ b/subprojects/libffi.wrap
+@@ -3,6 +3,7 @@ directory=libffi
+ url=https://gitlab.freedesktop.org/gstreamer/meson-ports/libffi.git
+ revision=meson
+ depth=1
++patch_directory=libffi-patches
+ 
+ [provide]
+ libffi = ffi_dep

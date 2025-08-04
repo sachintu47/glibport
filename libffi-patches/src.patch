@@ -1,0 +1,2782 @@
+diff --git a/meson.build b/meson.build
+index ae7d0aa..baf6133 100644
+--- a/meson.build
++++ b/meson.build
+@@ -253,8 +253,16 @@ elif host_cpu_family == 'riscv64'
+   TARGET = 'RISCV'
+   c_sources = ['ffi.c']
+   asm_sources = ['sysv.S']
++elif host_cpu_family == 's390x'
++  if host_system == 'zos'
++      arch_subdir = 'zos'
++      TARGET = 'S390X'
++      c_sources = ['ffi.c']
++      asm_sources = ['xplink.s']
++  endif
+ endif
+ 
++
+ if TARGET == ''
+   error('Unsupported pair: system "@0@", cpu family "@1@"'.format(host_system, host_cpu_family))
+ endif
+diff --git a/src/meson.build b/src/meson.build
+index 1ac3b26..a87dad8 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -68,6 +68,18 @@ if is_msvc_like
+   ffi_asm_sources = ffi_asm_objs
+ endif
+ 
++ffi_asm_objs = []
++foreach asm_source : ffi_asm_sources
++  obj_name = asm_source.underscorify() + '.o'
++  ffi_asm_objs += custom_target(obj_name,
++    input: asm_source,
++    output: obj_name,
++    command: ['/bin/as', '-mgoff', '-o', '@OUTPUT@', '@INPUT@'],
++    build_by_default: true
++  )
++endforeach
++ffi_asm_sources = ffi_asm_objs
++
+ ffi_link_args = []
+ 
+ if get_option('ffi-build-versioned') and cc.has_argument('-x assembler-with-cpp')
+diff --git a/src/zos/ffi.c b/src/zos/ffi.c
+new file mode 100644
+index 0000000..d71e6a1
+--- /dev/null
++++ b/src/zos/ffi.c
+@@ -0,0 +1,1550 @@
++/* -----------------------------------------------------------------------
++   ffi.c - Copyright (c) 2000, 2007 Software AG
++           Copyright (c) 2008 Red Hat, Inc
++           Copyright (c) 2016, 2018 IBM Corp.
++
++   S390 Foreign Function Interface
++
++   Permission is hereby granted, free of charge, to any person obtaining
++   a copy of this software and associated documentation files (the
++   ``Software''), to deal in the Software without restriction, including
++   without limitation the rights to use, copy, modify, merge, publish,
++   distribute, sublicense, and/or sell copies of the Software, and to
++   permit persons to whom the Software is furnished to do so, subject to
++   the following conditions:
++
++   The above copyright notice and this permission notice shall be included
++   in all copies or substantial portions of the Software.
++
++   THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND, EXPRESS
++   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR
++   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++   OTHER DEALINGS IN THE SOFTWARE.
++   ----------------------------------------------------------------------- */
++/*====================================================================*/
++/*                          Includes                                  */
++/*                          --------                                  */
++/*====================================================================*/
++
++#include <ffi.h>
++#include <ffi_common.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++
++/*====================== End of Includes =============================*/
++
++/*====================================================================*/
++/*                           Defines                                  */
++/*                           -------                                  */
++/*====================================================================*/
++
++/* Maximum number of GPRs available for argument passing.  */
++#define MAX_GPRARGS 3
++
++/* Maximum number of FPRs available for argument passing.  */
++#define MAX_FPRARGS 4
++
++/* Round to multiple of 16.  */
++#define ROUND_SIZE(size) (((size) + 15) & ~15)
++
++/* If these values change, xplink.S must be adapted!  */
++#define FFI390_RET_VOID 0
++
++//struct returned in registers
++#define FFI390_RET_REG_STRUCT 1 
++#define FFI390_RET_FLOAT 2
++#define FFI390_RET_DOUBLE 3
++#define FFI390_RET_LDBLE 4
++#define FFI390_RET_INT32 5
++#define FFI390_RET_INT64 6
++#define FFI390_RET_INT16 7
++#define FFI390_RET_INT8 8
++//struct returned via pointer
++#define FFI390_RET_MEM_STRUCT 9
++
++
++#pragma map(ffi_call_xplink, "FFIXPLINK")
++extern void ffi_call_xplink(void (*fn)(void), extended_cif *, unsigned,
++                          unsigned *, unsigned, unsigned, unsigned);
++
++#pragma map(ffi_closure_xplink, "FFI_CLOSURE_XPLINK")
++extern void ffi_closure_xplink(void);
++
++/*====================================================================*/
++/*                                                                    */
++/* Name     - ffi_check_struct_type.                                  */
++/*                                                                    */
++/* Function - Determine if a structure can be passed within a         */
++/*            general purpose or floating point register.             */
++/*                                                                    */
++/*====================================================================*/
++
++static int ffi_check_struct_type(ffi_type *arg) {
++  size_t size = arg->size;
++
++  /* If the struct has just one element, look at that element
++     to find out whether to consider the struct as floating point.  */
++  while (arg->type == FFI_TYPE_STRUCT && arg->elements[0] && !arg->elements[1])
++    arg = arg->elements[0];
++
++  /* Structs of size 1, 2, 4, and 8 are passed in registers,
++     just like the corresponding int/float types.  */
++  switch (size) {
++  case 1:
++  case 2:
++    return FFI_TYPE_UINT32;
++  case 4:
++    if (arg->type == FFI_TYPE_FLOAT)
++      return FFI_TYPE_FLOAT;
++    else
++      return FFI_TYPE_UINT32;
++  case 8:
++    if (arg->type == FFI_TYPE_DOUBLE)
++      return FFI_TYPE_DOUBLE;
++    else {
++      return FFI_TYPE_UINT64;
++    }
++  default:
++    break;
++  }
++  /* Other structs are passed via a pointer to the data.  */
++  return FFI_TYPE_POINTER;
++}
++
++#pragma map(ffi_prep_args, "PREPARGS")
++void ffi_prep_args(unsigned char *arg, extended_cif *ecif, unsigned char *stack)
++{
++  /* The stack space will be filled with these areas:
++     Note: XPLINK Stack is downward growing
++     ------------------------------------ <- Low Addresses
++       Guard Page (4KB)
++     ------------------------------------ 
++       Stack Frame for Called functions
++     ------------------------------------ <- Stack Ptr (r4)
++       Backchain                            |+2048
++     ------------------------------------   |
++       Environment                          |
++     ------------------------------------   |
++       Entry Point                          |  Savearea 
++     ------------------------------------   |  48 bytes
++       Return Address                       |
++     ------------------------------------   |
++       R8 - R15                             |
++     ------------------------------------ <-
++       Reserved (8 bytes)                   +2096
++     ------------------------------------ 
++       Debug Area (4 bytes)                 +2104
++     ------------------------------------ 
++       Arg area prefix (4 bytes)            +2108
++     ------------------------------------ 
++       Argument area: Parm1 ... ParmN       +2112
++     ------------------------------------ 
++       Local (automatic storage)
++      Saved FPRs   Saved  ARs   Saved VRs 
++     ------------------------------------ <- High Addresses
++  */
++
++#ifdef FFI_DEBUG
++  printf("arg1: %p:%p:%p\n", arg, ecif, stack);
++#endif
++
++  int i;
++  ffi_type **type_ptr;
++  void **p_argv = ecif->avalue;
++  unsigned char* arg_ptr = stack;
++  
++  // number of free gprs
++  int gprs = 3;
++  
++  /* If we returning a structure larger than 12bytes,
++     we set the first parameter register
++     to the address of where we are returning this structure.  
++   */  
++   if (ecif->cif->flags == FFI390_RET_MEM_STRUCT) {
++     *(void**) arg_ptr = ecif->rvalue;
++     arg_ptr += 8;
++   }
++
++   /*Now for the arguments.  */
++  for (type_ptr = ecif->cif->arg_types, i = ecif->cif->nargs;
++       i > 0;
++       i--, type_ptr++, p_argv++)
++    {
++      void *arg = *p_argv;
++      int type = (*type_ptr)->type;
++      int size = (*type_ptr)->size;
++
++      /* zero out the memory */
++      *(long*)arg_ptr = 0; 
++
++     /*  Check how a structure type is passed.   */
++      if (type == FFI_TYPE_STRUCT) {
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr, p_argv, (*type_ptr)->size);
++	      #endif
++        memcpy(arg_ptr, *p_argv, (*type_ptr)->size);
++				arg_ptr += 8*(((*type_ptr)->size + 7)/8);
++        continue;
++      }
++  
++    /*  Now handle all primitive int/pointer/float data types.  */
++    switch (type) 
++	  {
++      #if FFI_TYPE_LONGDOUBLE != FFI_TYPE_DOUBLE 
++      case FFI_TYPE_LONGDOUBLE: 
++        *(long double *) arg_ptr = * (long double *) (*p_argv);
++        break;
++      #endif
++
++      case FFI_TYPE_DOUBLE:
++      case FFI_TYPE_COMPLEX:
++        *(double *) arg_ptr = * (double *) (*p_argv);
++        break;
++    
++      case FFI_TYPE_FLOAT:
++        *(float *) arg_ptr = * (float *) (*p_argv);
++        break;
++
++      case FFI_TYPE_POINTER:
++      case FFI_TYPE_SINT64:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr, p_argv, (*type_ptr)->size);
++        #endif
++        *(signed long long *) arg_ptr = * (signed long long *) (* p_argv);
++        break;
++
++      case FFI_TYPE_UINT64:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr, p_argv, (*type_ptr)->size);
++        #endif
++        *(unsigned long long *) arg_ptr = * (unsigned long long *) (* p_argv);
++        break;
++  
++      case FFI_TYPE_UINT32:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr+4, p_argv, (*type_ptr)->size);
++        #endif
++        if (gprs > 0) {
++          *(unsigned long *) (arg_ptr) = * ((unsigned int *) (*(p_argv)));
++          gprs--;
++        }
++        else {
++          *(unsigned int *) (arg_ptr+4) = * (unsigned int *) (*p_argv);
++        }
++        break;
++  
++      case FFI_TYPE_SINT32:
++      case FFI_TYPE_INT:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr+4, p_argv, (*type_ptr)->size);
++        #endif
++        if (gprs > 0) {
++          *(signed long *) (arg_ptr) = * ((signed int *) (*(p_argv)));
++          gprs--;
++        }
++        else {
++          *(signed int *) (arg_ptr+4) = * ((signed int *) (*(p_argv)));
++        }
++        break;
++  
++      case FFI_TYPE_UINT16:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr+6, p_argv, (*type_ptr)->size);
++        #endif
++        if (gprs > 0) {
++          *(unsigned long *) (arg_ptr) = * (unsigned short *) (* p_argv);
++          gprs--;
++        }
++        else {
++          *(unsigned short *) (arg_ptr+6) = * (unsigned short *) (* p_argv);
++        }
++        break;
++  
++      case FFI_TYPE_SINT16:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr+6, p_argv, (*type_ptr)->size);
++        #endif
++        if (gprs > 0) {
++          *(signed long *) (arg_ptr) = * (signed short *) (* p_argv);
++          gprs--;
++        }
++        else {
++          *(signed short *) (arg_ptr+6) = * (signed short *) (* p_argv);
++        }
++        break;
++
++      case FFI_TYPE_UINT8:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr+7, p_argv, (*type_ptr)->size);
++        #endif
++        if (gprs > 0) {
++          *(unsigned long *) (arg_ptr) = * (unsigned char *) (* p_argv);
++          gprs--;
++        }
++        else { 
++          *(unsigned char *) (arg_ptr+7) = * (unsigned char *) (* p_argv);
++        }
++        break;
++  
++      case FFI_TYPE_SINT8:
++        #ifdef FFI_DEBUG
++          printf("ptr:%p, p_argv:%p, size:%d\n", arg_ptr+7, p_argv, (*type_ptr)->size);
++        #endif
++        if (gprs > 0) {
++          *(signed long *) (arg_ptr) = * (signed char*) (* p_argv);
++          gprs--;
++        }
++        else { 
++          *(signed char *) (arg_ptr+7) = * (signed char*) (* p_argv);
++        }
++        break;
++  
++      default:
++        FFI_ASSERT (0);
++        break;
++          }
++        arg_ptr += 8;
++    }
++}
++/**
++void ffi_prep_args(void *stack, extended_cif *ecif, char *argument) {
++
++
++  int gprs = 3; 
++  int fprs = 4;
++  ffi_type* t; 
++  
++  extended_cif e = *ecif;
++  char* args = argument;
++
++  for(int i = 0; i < e.cif->nargs; i++) {
++  
++    t = e.cif->arg_types[i];
++    printf("%p\n", args);
++    switch(t->type) {
++
++
++      case FFI_TYPE_STRUCT:
++          memcpy(args, e.avalue[i], t->size);
++          args = align(args + t->size);
++          break;  
++  
++      case FFI_TYPE_UINT32:
++      case FFI_TYPE_SINT32:
++          *(int*)(args+4) = 2;//*(int*)e.avalue[i];
++        break;
++
++      default:
++        break;
++    }
++
++    }
++}**/
++  //*(int*)(&(argument[6])) = 0x00;
++  //*(int*)(&(argument[7])) = 0x00;
++  //printf("abc:%p:%p:%p\n", stack, ecif, (argument+3)) ;
++  
++
++   //Not Needed yet 
++   //printf("testcase\n");
++
++
++/*======================== End of Routine ============================*/
++
++
++/*====================================================================*/
++/*                                                                    */
++/* Name     - ffi_prep_cif_machdep.                                   */
++/*                                                                    */
++/* Function - Perform machine dependent CIF processing.               */
++/*                                                                    */
++/*====================================================================*/
++
++ffi_status ffi_prep_cif_machdep(ffi_cif *cif) { 
++  ffi_type **ptr;
++  int i;
++
++  /* Determine return value handling.
++     Integral values <=4bytes are widened and put in GPR3
++     Integral values >4bytes and <=8bytes are widened and put in
++     GPR2 (left most 32-bits) and GPR3 (right most 32-bits)
++     Floating point values, including complex type, are returned in
++     FPR0, FPR2, FPR4, FPR6 (as many registers as required)
++     Aggregates size of <=4 are returned GPR1 (left adjusted)
++     Aggregates size between 5bytes-8bytes are returned in GPR1 and
++     GPR2 (left adjusted)
++     Aggregates size between 9bytes-12bytes are returned in GPR1, GPR2,
++     and GPR3 (left adjusted)
++     Anything greater in size and anyother type is returned in a buffer,
++     the buffer is passed in as hidden first argument.
++     */
++
++  size_t struct_size;
++
++  switch (cif->rtype->type) {
++  /* Void is easy.  */
++  case FFI_TYPE_VOID:
++    cif->flags = FFI390_RET_VOID;
++    break;
++
++  /* Structures are returned in GPR or buffer depending on size.  */
++  case FFI_TYPE_STRUCT:
++    struct_size = cif->rtype->size;
++    if (struct_size <= 12)
++      cif->flags = FFI390_RET_REG_STRUCT;
++    else
++    {
++      cif->flags = FFI390_RET_MEM_STRUCT;
++    }
++      //n_ov = struct_size;
++    break;
++
++  /* Floating point and complex values are returned in fpr0, 2, 4, 6 */
++  case FFI_TYPE_FLOAT:
++    cif->flags = FFI390_RET_FLOAT;
++    break;
++  
++  case FFI_TYPE_COMPLEX:
++  case FFI_TYPE_DOUBLE:
++    cif->flags = FFI390_RET_DOUBLE;
++    break;
++
++  
++        
++  case FFI_TYPE_LONGDOUBLE:
++    cif->flags = FFI390_RET_LDBLE;
++    break;
++  /* Integer values are returned in gpr 3 (and gpr 2
++     for 64-bit values on 31-bit machines).  */
++  case FFI_TYPE_UINT64:
++  case FFI_TYPE_SINT64:
++  case FFI_TYPE_POINTER:
++    cif->flags = FFI390_RET_INT64;
++    break;
++  case FFI_TYPE_UINT16:
++  case FFI_TYPE_SINT16:
++    cif->flags = FFI390_RET_INT16;
++    break;
++  case FFI_TYPE_UINT8:
++  case FFI_TYPE_SINT8:
++    cif->flags = FFI390_RET_INT8;
++    break;
++  case FFI_TYPE_UINT32:
++  case FFI_TYPE_SINT32:
++  case FFI_TYPE_INT:
++    cif->flags = FFI390_RET_INT32;
++    break;
++  default:
++    FFI_ASSERT(0);
++    break;
++  }
++  return FFI_OK;
++}
++
++/*======================== End of Routine ============================*/
++
++/*====================================================================*/
++/*                                                                    */
++/* Name     - ffi_call.                                               */
++/*                                                                    */
++/* Function - Call the FFI routine.                                   */
++/*                                                                    */
++/*====================================================================*/
++void ffi_call(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue) {
++  int ret_type = cif->flags;
++  extended_cif ecif;
++  
++  ecif.cif = cif;
++  ecif.avalue = avalue;
++  ecif.rvalue = rvalue;
++
++  /* If we don't have a return value, we need to fake one.  */
++  if (rvalue == NULL) {
++    ret_type = FFI_TYPE_VOID;
++  }
++
++  switch (cif->abi) {
++  case FFI_XPLINK:
++    ffi_call_xplink(fn, &ecif, cif->flags, ecif.rvalue, cif->bytes, cif->nargs,
++                  (*cif->arg_types)->size);
++    break;
++
++  default:
++    FFI_ASSERT(0);
++    break;
++  }
++}
++
++
++
++/*======================== End of Routine ============================*/
++
++/*====================================================================*/
++/*                                                                    */
++/* Name     - ffi_prep_closure_loc.                                   */
++/*                                                                    */
++/* Function - Prepare a FFI closure.                                  */
++/*                                                                    */
++/*====================================================================*/
++
++static ffi_closure *closure_global = NULL;
++
++/** 
++ * Okay so here's the quick and dirty guide to XPLINK 
++ * the layout of an 64bit-XPLINK function is as follows
++ *
++ *  |----------------------------|
++ *  |   Addr func's env area     | both parts together are 
++ *  |                            | the "function descriptor"
++ *  |   Addr func's entry point  | both 8-bytes long and 8-byte aligned
++ *  |----------------------------|
++ *  
++ *  Now assunming addr of entry point is 0 we have
++ *  -0x10 | Eyecatcher[0 - 56] | Type[57-63]    | See table below
++ *  -0x08 | Offset to PPA1(described below)     | 
++ *  -0x04 | DSA Size[0-26] | Entry flags[27-32] | See note below
++ *   0x00 | Prolog start                        |
++ *        |     .
++ *        |     .
++ *        |     .
++ *
++ * PPA1(Program Prolog Area1):
++ *    
++ * 
++ * Notes on Entry Flags:
++ *    Bit 1 indicates if routine is an XPLEAF routine
++ *    these routines save caller's registers in their own stack frame, 
++ *    but do not update the stack pointer
++ *    Bit 2 indicates if the routine uses the alloca() service.
++ 
++ 
++ **/
++
++/**
++ * this is the function that prepares the closure
++ * some details:
++ *     fun: takes in cif, ret, args and user_data
++ *     closure: struct that holds the cif and user data
++ *     codeloc: we need to set this to the trampoline
++ * 
++ * so essentially this function copies the trampoline, cif and userdata
++ * into the closure
++ * 
++ * purpose of the trampoline(when called): 
++ *        1.) execute the function prolog,
++ *        2.) collect all the arguments and stick them into an array
++ *        3.) call the actual bound function
++ *        4.) take the return and put it in the proper spot(typically r3)
++ *        5.) execute the function epilog
++ * 
++ * 
++ * Since this is z/OS there are some oddities 1.) function pointers don't
++ * actually point to the function, rather they point to the PPA
++ * so we emulate that here. 
++**/
++
++//info about calling functions via pointers
++//https://www.ibm.com/support/knowledgecenter/en/SSLTBW_2.1.0/com.ibm.zos.v2r1.ieab200/iea3b2_XPLINK1.htm
++
++ffi_status ffi_prep_closure_loc(ffi_closure *closure, ffi_cif *cif,
++                                void (*fun)(ffi_cif *, void *, void **, void *),
++                                void *user_data, void *codeloc) {
++    
++  if (cif->abi != FFI_XPLINK)
++    return FFI_BAD_ABI;
++
++  closure->cif = cif;
++  closure->user_data = user_data;
++  closure->fun = fun; 
++
++  //Begin: HACK ALERT, FIX ASAP
++  
++  long reg5;
++    
++    __asm__(" STG 5,%0\n"
++        :"=m"(reg5)
++        :"r"(reg5) //HLASM complains without this
++                   //Never used but needed
++    );
++
++  //End: HACK ALERT
++
++  long *tramp = closure->tramp;
++
++  //setup function descriptor
++  tramp[0] =  reg5;        //env area pointer
++  tramp[1] =  &(tramp[2]); //func entry point
++
++  //address of trampoline for call
++  char *load_closure = &(tramp[2]);
++
++  // argument area of caller, where we'll save the GPRs
++  long caller_argarea = 2176; 
++
++  // the start of our local storage
++  long localstorage = 2176 + 4*8;
++
++  // callback functions take 4 args(all pointers)
++  long argareasize = 4*8;
++  
++  // Fixed constant size for register save area
++  long saveareasize = 256;
++
++  // localsize = 8 * num pointers + save area for FPR's(incase we need them) 
++  long localsize = 8 * cif->nargs + 8 * 8;
++
++  //total size of stack frame
++  long dsasize = argareasize + saveareasize + localsize; 
++
++  //this is the for the offset from r4 to the save area
++  int save_area = 2208;
++
++  int pc = 0; //not technically the program counter, but the index in the tramp 
++
++  //generate prolog, 
++  //STMG 	r6,r10,2048-dsasize(r4)
++  load_closure[pc++] =  0xEB; //STMG
++  load_closure[pc++] =  0x4E; //r4, r15
++
++  //4 is the base register(sp) and the upper 4 bits of the lower 12 bits...
++  load_closure[pc++] =  0x40 | (((2048 - dsasize) >> 8) & 0xF);
++  
++  //STMG stores the 20 bit immediate as | Low(12 bits) | High(8 bits) | 
++  load_closure[pc++] = (2048 - dsasize) & (0xFF);
++  load_closure[pc++] = (2048 - dsasize) >> 12;
++  
++  load_closure[pc++] =  0x24;  //r4
++
++  //AGHI 	4,-dsasize
++  load_closure[pc++] = 0xA7;
++  load_closure[pc++] = 0x4B;
++  load_closure[pc++] = (-dsasize) >> 8;
++  load_closure[pc++] = (-dsasize);
++
++  // --------- end of prolog ---------
++
++
++  // now we need load everything up into an array.
++  // Note: the array we load everything into is consider automatic storage
++  // and not the argument area where xplink typically passes in arguments. 
++
++  //this will be the loop index for args-list(the ffi one) 
++  //LGHI r5, 0 
++  load_closure[pc++] = 0xC0; 
++  load_closure[pc++] = 0x51;
++  
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x00;  
++  load_closure[pc++] = 0x00;
++  
++  //argument area + 32(cif*, ret*, args*, user*) +  4*8(for the fprs)
++  int arglist = 2176; //2192 + dsasize;
++
++  //load up stack pointer for incoming argument area(in callers dsa)
++  //LAY 8, dsasize(,4)  
++  load_closure[pc++] = 0xE3;
++  load_closure[pc++] = 0x80;
++  load_closure[pc++] =  0x40 | (((arglist) >> 8) & 0xF);
++  load_closure[pc++] = (arglist) & (0xFF);
++  load_closure[pc++] = (arglist) >> 12;
++  load_closure[pc++] = 0x71;
++
++  //number of unstored gpr's / fpr's
++  int gpr = 3;
++  int fpr = 4;
++
++  //So what does this loop do?
++  //this loop puts the arguments into the ffi arg array
++  //so if we have something in a register we need to store it
++  //which we do in the save area for the GPRs 1-3
++  //but for FPR's we put them in local storage
++  //and otherwise we can just grab the pointer 
++  //from the argument area of the caller 
++  //we load the address into r6 and store that into the ffi argument array
++  //which is also in local storage
++  // --------------------------------- argument area = r4 + 2176
++  // param 1  
++  // param 2
++  // param 3
++  // param 4   
++  // --------------------------------- r4 + 
++  // FPR1 save
++  // FPR2 save
++  // FPR3 save
++  // FPR4 save
++  // --------------------------------- 
++  // Address of arg1
++  // Address of arg2
++  // Address of arg3
++  //       . 
++  //       .
++  //       .
++  //       .
++  // ---------------------------------
++  for(int i = 0; i < cif->nargs; i++) {
++    switch(cif->arg_types[i]->type) {
++      
++
++      /*case FFI_TYPE_STRUCT:
++        if(cif->arg_types[i]->size <= 8) {
++          //generate store for r1
++          //STG     R1,2176+dsasize(,R4)
++          load_closure[pc++] = 0x42;
++          load_closure[pc++] = 0x10;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++          
++          //LA      R6,2624(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++        }
++        else if(cif->arg_types[i]->size <= 16) {
++          //generate store for r1
++          //STG     R1,2176+dsasize(,R4)
++          load_closure[pc++] = 0x42;
++          load_closure[pc++] = 0x10;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++          
++          //LA      R6,2624(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++        }
++        break;*/
++
++      case FFI_TYPE_SINT8:
++      case FFI_TYPE_UINT8:
++        if(i > 2) {
++          //move element from arg list(xplink one from the calling function)
++          //LA 6, (2216 + dsasize)(,8)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x65;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 7) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 7) & 0xFF);
++        }         
++        else if(i == 0) {
++          //generate store for r1
++          //STG     R1,2176+dsasize(,R4)
++          load_closure[pc++] = 0x42;
++          load_closure[pc++] = 0x10;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++
++          //STG     R2,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x42;
++          load_closure[pc++] = 0x20;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++
++          //LA      R6,2624(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++        }
++        else if(i == 1) {
++          //generate store for r2
++          //STG     R2,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x42;
++          load_closure[pc++] = 0x20;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++          
++          //LA      R6,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++        }
++        else if(i == 2) {
++          //generate store for r3
++          //STG     R3,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0x42;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++
++          //LA      R6,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++        }
++        break;
++
++      case FFI_TYPE_SINT16:
++      case FFI_TYPE_UINT16:
++        if(i > 2) {
++          //move element from arg list(xplink one from the calling function)
++          //LA 6, (2216 + dsasize)(,8)
++          load_closure[pc++] = 0x40;
++          load_closure[pc++] = 0x65;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 6) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 6) & 0xFF);
++        }         
++        else if(i == 0) {
++          //generate store for r1
++          //STG     R1,2176+dsasize(,R4)
++          load_closure[pc++] = 0x40;
++          load_closure[pc++] = 0x10;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++
++          //LA      R6,2624(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++        }
++        else if(i == 1) {
++          //generate store for r2
++          //STG     R2,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x40;
++          load_closure[pc++] = 0x20;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++          
++          //LA      R6,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++        }
++        else if(i == 2) {
++          //generate store for r3
++          //STG     R3,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0x40;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++
++          //LA      R6,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++        }
++        break;
++
++      case FFI_TYPE_INT:
++      case FFI_TYPE_SINT32:
++      case FFI_TYPE_UINT32:
++        if(i > 2) {
++          //move element from arg list(xplink one from the calling function)
++          //LA 6, (2216 + dsasize)(,8)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x65;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 4) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 4) & 0xFF);
++        }         
++        else if(i == 0) {
++          //generate store for r1
++          //STG     R1,2176+dsasize(,R4)
++          load_closure[pc++] = 0x50;
++          load_closure[pc++] = 0x10;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++
++          //LA      R6,2624(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++        }
++        else if(i == 1) {
++          //generate store for r2
++          //STG     R2,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x50;
++          load_closure[pc++] = 0x20;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++          
++          //LA      R6,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++        }
++        else if(i == 2) {
++          //generate store for r3
++          //STG     R3,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0x50;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++
++          //LA      R6,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++        }
++        break;
++      
++      case FFI_TYPE_SINT64:
++      case FFI_TYPE_UINT64:
++      case FFI_TYPE_POINTER:
++        if(i > 2) {
++          //move element from arg list(xplink one from the calling function)
++          //LA 6, (2216 + dsasize)(,8)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x65;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++        }         
++        else if(i == 0) {
++          //generate store for r1
++          //STG     R1,2176+dsasize(,R4)
++          load_closure[pc++] = 0xe3;
++          load_closure[pc++] = 0x10;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++          load_closure[pc++] = 0x00;
++          load_closure[pc++] = 0x24;
++
++          //LA      R6,2624(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++        }
++        else if(i == 1) {
++          //generate store for r2
++          //STG     R2,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0xe3;
++          load_closure[pc++] = 0x20;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++          load_closure[pc++] = 0x00;
++          load_closure[pc++] = 0x24;
++
++          //LA      R6,2176+dsasize+8(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 8) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 8) & 0xFF);
++        }
++        else if(i == 2) {
++          //generate store for r3
++          //STG     R3,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0xe3;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++          load_closure[pc++] = 0x00;
++          load_closure[pc++] = 0x24;
++
++          //LA      R6,2176+dsasize+16(,R4)
++          load_closure[pc++] = 0x41;
++          load_closure[pc++] = 0x60;
++          load_closure[pc++] = 0x40 | (((2176 + dsasize + 16) & 0xF00) >> 8);
++          load_closure[pc++] = ((2176 + dsasize + 16) & 0xFF);
++        }
++        break;
++
++      case FFI_TYPE_DOUBLE: 
++        if(fpr == 0) {
++            //move element from arg list(xplink one from the calling function)
++            //LA 6, 2112(5,4)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x65;
++            load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++            load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++          } 
++          else if(fpr == 4) {
++            //this warrents some explanation
++            //Integral(and struct but ignore that for now) arguments are passed in
++            //gpr1-3 depending on their position in the arguement list meaning 
++            //foo(float, int, int) would use fpr0, gpr2 and gpr3 to pass in its
++            //arguments, however the first 4 floats/doubles go in frp0-6 regardles
++            //of where they are in the function so for example
++            //foo(int, float, int) would use gpr1, frp0 and gpr3 becaues of this
++            //unlike the integral case where the offset into the args list is
++            //based on the loop index(arg number) we must keep track of the number
++            //of used fpr's hence the difference in tracking. this also messes up
++            //the save area
++            //generate store for fpr0
++            //STD 0, 2624(,8)
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x00;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa0;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa0;
++            fpr--;
++          }
++          else if(fpr == 3) {
++            //generate store for fpr2
++            //STD 2, 2624(,8)
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x20;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa8;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa8;
++            fpr--;
++          }      
++          else if(fpr == 2) {
++            //generate store for fpr4
++            //STD 4, 2624(,8)
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x40;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb0;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb0;
++            fpr--;
++          }
++          else if(fpr == 1) {
++            //generate store for fpr6
++            //STD 6, 2624(,8)
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb8;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb8;
++            fpr--;
++          }
++          break;
++
++      case FFI_TYPE_FLOAT: 
++        if(fpr == 0) {
++            //move element from arg list(xplink one from the calling function)
++            //LA 6, 2112(5,4)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x65;
++            load_closure[pc++] = 0x40 | (((2176 + dsasize) & 0xF00) >> 8);
++            load_closure[pc++] = ((2176 + dsasize) & 0xFF);
++          } 
++          else if(fpr == 4) {
++            //this warrents some explanation
++            //Integral(and struct but ignore that for now) arguments are passed in
++            //gpr1-3 depending on their position in the arguement list meaning 
++            //foo(float, int, int) would use fpr0, gpr2 and gpr3 to pass in its
++            //arguments, however the first 4 floats/doubles go in frp0-6 regardles
++            //of where they are in the function so for example
++            //foo(int, float, int) would use gpr1, frp0 and gpr3 becaues of this
++            //unlike the integral case where the offset into the args list is
++            //based on the loop index(arg number) we must keep track of the number
++            //of used fpr's hence the difference in tracking. this also messes up
++            //the save area
++            //generate store for fpr0
++            //STD 0, 2624(,8)
++            load_closure[pc++] = 0x70;
++            load_closure[pc++] = 0x00;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa0;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa0;
++            fpr--;
++          }
++          else if(fpr == 3) {
++            //generate store for fpr2
++            //STD 2, 2624(,8)
++            load_closure[pc++] = 0x70;
++            load_closure[pc++] = 0x20;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa8;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xa8;
++            fpr--;
++          }      
++          else if(fpr == 2) {
++            //generate store for fpr4
++            //STD 4, 2624(,8)
++            load_closure[pc++] = 0x70;
++            load_closure[pc++] = 0x40;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb0;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb0;
++            fpr--;
++          }
++          else if(fpr == 1) {
++            //generate store for fpr6
++            //STD 6, 2624(,8)
++            load_closure[pc++] = 0x70;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb8;
++
++            //LA 6, 2624(,8)
++            load_closure[pc++] = 0x41;
++            load_closure[pc++] = 0x60;
++            load_closure[pc++] = 0x48;
++            load_closure[pc++] = 0xb8;
++            fpr--;
++          }
++          break;
++    }
++
++    //store pointer of arg into arglist(the ffi one)    
++    //STG 6, 2112+12+8*3(5,4) 
++    load_closure[pc++] = 0xE3;
++    load_closure[pc++] = 0x65;
++    load_closure[pc++] = 0x48;
++    load_closure[pc++] = 0xc4;
++    load_closure[pc++] = 0x00;
++    load_closure[pc++] = 0x24;
++  
++
++    //AGHI 	5,8;
++    load_closure[pc++] = 0xA7;
++    load_closure[pc++] = 0x5B;
++    load_closure[pc++] = 0x00;
++    load_closure[pc++] = 0x08;
++  }
++  
++  //handle the return value, normally this is passed in as the r2 the 2nd param
++  //however in the even that we're returning a struct that needs to go in 
++  //via memory then we actually use r1 to pass in a pointer to the return buffer
++  //meaning that we actually can just load r2 with the callers r1
++  //this is very fortunate since xplink requires functions to know exactly
++  //how much stack space they need ahead of time, since we allocate the return
++  //on the stack, we know it can be at most 12 bytes saving us from a bunch of 
++  //computation.
++
++  if(cif->flags == FFI390_RET_MEM_STRUCT) {
++    //LGR 2,1
++    load_closure[pc++] = 0xB9;
++    load_closure[pc++] = 0x04;
++    load_closure[pc++] = 0x00;
++    load_closure[pc++] = 0x00;
++    load_closure[pc++] = 0x21;
++  }
++  
++  //load into r2(param2) a pointer to the return value buffer we allocate
++  //NOTE: this is not the same as the buffer allocated by xplink to store a 
++  //large struct as a return, this is a buffer allocated by ffi on all platforms
++  
++  else {
++    //LAY 2, 2132(0, 4) 
++    load_closure[pc++] = 0x41;
++    load_closure[pc++] = 0x20;
++    load_closure[pc++] = 0x48;
++    load_closure[pc++] = 0xa0;
++  }
++
++  //load into r1(param 1) a pointer to the cif 
++
++  //since we do the check for whether we're returning a struct above
++  //we load r1 after loading r2 to avoid clobbering an important register.
++  long cif_addr = (long)closure->cif;
++
++  //LGFI 6,&fun
++  load_closure[pc++] = 0xC0; 
++  load_closure[pc++] = 0x11;
++  load_closure[pc++] =  (cif_addr >> 56) & 0xFF;
++  load_closure[pc++] =  (cif_addr >> 48) & 0xFF;
++  load_closure[pc++] =  (cif_addr >> 40) & 0xFF;
++  load_closure[pc++] =  (cif_addr >> 32) & 0xFF;
++
++  //SLLG 6, 32
++  load_closure[pc++] = 0xEB;
++  load_closure[pc++] = 0x11;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x20;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x0D;
++
++  //LGFI 6,&fun
++  load_closure[pc++] = 0xC0; 
++  load_closure[pc++] = 0x01;
++  load_closure[pc++] =  (cif_addr >> 24) & 0xFF;
++  load_closure[pc++] =  (cif_addr >> 16) & 0xFF;
++  load_closure[pc++] =  (cif_addr >> 8) & 0xFF;
++  load_closure[pc++] =  (cif_addr >> 0) & 0xFF;
++
++  //OGR 6,0
++  load_closure[pc++] = 0xB9;
++  load_closure[pc++] = 0x81;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x10;
++
++
++  //load into r3(param 3) a pointer to the arguments the function is called with 
++  //2112 + 64 is not a magic number, but rather the offset from sp to local
++  //storage + 16 bytes for the arg area(constant size) + 24 for r1-3.
++
++  //LAY 3, 2112+16(,4)
++  load_closure[pc++] = 0xE3;
++  load_closure[pc++] = 0x30;
++  load_closure[pc++] = 0x40 | (((2244) >> 8) & 0xF);
++  load_closure[pc++] = (2244) & (0xFF);
++  load_closure[pc++] = (2244) >> 12;
++  load_closure[pc++] = 0x71;
++
++
++  //load up the "user data" part of the function
++  //the user data itself is allocated by the user
++  //we use the first part of the argument area to store a pointer to the list
++
++  long user_data_ptr = (long)closure->user_data;
++
++  //LGFI 6,&fun
++  load_closure[pc++] = 0xC0; 
++  load_closure[pc++] = 0x61;
++  load_closure[pc++] =  (user_data_ptr >> 56) & 0xFF;
++  load_closure[pc++] =  (user_data_ptr >> 48) & 0xFF;
++  load_closure[pc++] =  (user_data_ptr >> 40) & 0xFF;
++  load_closure[pc++] =  (user_data_ptr >> 32) & 0xFF;
++
++  //SLLG 6, 32
++  load_closure[pc++] = 0xEB;
++  load_closure[pc++] = 0x66;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x20;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x0D;
++
++  //LGFI 6,&fun
++  load_closure[pc++] = 0xC0; 
++  load_closure[pc++] = 0x01;
++  load_closure[pc++] =  (user_data_ptr >> 24) & 0xFF;
++  load_closure[pc++] =  (user_data_ptr >> 16) & 0xFF;
++  load_closure[pc++] =  (user_data_ptr >> 8) & 0xFF;
++  load_closure[pc++] =  (user_data_ptr >> 0) & 0xFF;
++
++  //OGR 6,0
++  load_closure[pc++] = 0xB9;
++  load_closure[pc++] = 0x81;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x60;
++
++  //STG 6,
++  load_closure[pc++] = 0xE3;
++  load_closure[pc++] = 0x60;
++  load_closure[pc++] = 0x48;
++  load_closure[pc++] = 0x98;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x24;
++
++  // LOAD UP FUNCTION/Branch target 
++  long fun_addr = (long)closure->fun;
++
++  //LGFI 6,&fun
++  load_closure[pc++] = 0xC0; 
++  load_closure[pc++] = 0x61;
++  load_closure[pc++] =  (fun_addr >> 56) & 0xFF;
++  load_closure[pc++] =  (fun_addr >> 48) & 0xFF;
++  load_closure[pc++] =  (fun_addr >> 40) & 0xFF;
++  load_closure[pc++] =  (fun_addr >> 32) & 0xFF;
++
++  //SLLG 6, 32
++  load_closure[pc++] = 0xEB;
++  load_closure[pc++] = 0x66;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x20;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x0D;
++
++  //LGFI 6,&fun
++  load_closure[pc++] = 0xC0; 
++  load_closure[pc++] = 0x01;
++  load_closure[pc++] =  (fun_addr >> 24) & 0xFF;
++  load_closure[pc++] =  (fun_addr >> 16) & 0xFF;
++  load_closure[pc++] =  (fun_addr >> 8) & 0xFF;
++  load_closure[pc++] =  (fun_addr >> 0) & 0xFF;
++
++  //OGR 6,0
++  load_closure[pc++] = 0xB9;
++  load_closure[pc++] = 0x81;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x60;
++
++  //load environment and function addresses
++  //LMG 	5,6,0(Rx)
++  load_closure[pc++] = 0xEB;
++  load_closure[pc++] = 0x56;
++  load_closure[pc++] = 0x60;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x04;
++  
++  //BASR 7,6
++  load_closure[pc++] = 0x0D;
++  load_closure[pc++] = 0x76;
++
++  //NOPR 0
++  //this exist to tell the program that it was called by BASR
++  load_closure[pc++] = 0x00;
++  load_closure[pc++] = 0x00;
++
++  //If the return is a large struct, we don't have to do anything
++  //we already tricked ffi into placing the return in the right spot
++  if(cif->flags != FFI390_RET_MEM_STRUCT) {
++
++    //LAY r3, 2208(,4)
++    load_closure[pc++] = 0x41;
++    load_closure[pc++] = 0x30;
++    load_closure[pc++] = 0x48;
++    load_closure[pc++] = 0xa0;
++
++    if(cif->rtype != NULL) {
++      switch (cif->rtype->type)
++      {
++        case FFI_TYPE_SINT8:
++        case FFI_TYPE_UINT8:
++          //LGBR      R3,0(,R6)
++          load_closure[pc++] = 0xE3;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x07; 
++          load_closure[pc++] = 0x00; 
++          load_closure[pc++] = 0x76; 
++          break; 
++        case FFI_TYPE_SINT16:
++        case FFI_TYPE_UINT16:
++          //e33048c00015
++          //LH      R3,0(,R6)
++          load_closure[pc++] = 0x48;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x06;  
++          break;
++        case FFI_TYPE_INT:
++        case FFI_TYPE_SINT32:
++        case FFI_TYPE_UINT32:
++          //L      R3,0(,R6)
++          load_closure[pc++] = 0x58;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x04;  
++          break;
++        case FFI_TYPE_UINT64:
++        case FFI_TYPE_SINT64:
++        case FFI_TYPE_POINTER:
++          //LG      R3,0(,R6)
++          load_closure[pc++] = 0xE3;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x00;
++          load_closure[pc++] = 0x00;
++          load_closure[pc++] = 0x04;
++          break;
++        case FFI_TYPE_FLOAT:
++          load_closure[pc++] = 0x78;
++          load_closure[pc++] = 0x00;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x00;
++          break;
++        case FFI_TYPE_DOUBLE:
++          load_closure[pc++] = 0x68;
++          load_closure[pc++] = 0x00;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x00;
++          break;
++        case FFI_TYPE_COMPLEX:
++        case FFI_TYPE_LONGDOUBLE:
++          //real part
++          load_closure[pc++] = 0x68;
++          load_closure[pc++] = 0x20;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x00;
++          //imaginary part
++          load_closure[pc++] = 0x68;
++          load_closure[pc++] = 0x40;
++          load_closure[pc++] = 0x30;
++          load_closure[pc++] = 0x08;
++          break;
++        default:
++          break;
++      }
++    }
++  }
++  //LAY 4, dsasizes(,4)
++  load_closure[pc++] = 0xE3;
++  load_closure[pc++] = 0x40;
++  load_closure[pc++] =  0x40 | (((dsasize) >> 8) & 0xF);
++  load_closure[pc++] = (dsasize) & (0xFF);
++  load_closure[pc++] = (dsasize) >> 12;
++  load_closure[pc++] = 0x71;
++
++
++  load_closure[pc++] = 0xEB;
++  load_closure[pc++] = 0x5F;
++  //4 is the base register(sp) and the upper 4 bits of the lower 12 bits...
++  load_closure[pc++] =  0x40 | (((2048 - dsasize + 8) >> 8) & 0xF);
++  
++  //STMG stores the 20 bit immediate as | Low(12 bits) | High(8 bits) | 
++  load_closure[pc++] = (2048 - dsasize + 8) & (0xFF);
++  load_closure[pc++] = (2048 - dsasize + 8) >> 12;
++  load_closure[pc++] = 0x04;
++
++  //BASR 7,7
++  load_closure[pc++] = 0x0D;
++  load_closure[pc++] = 0x77;
++
++
++  return FFI_OK;
++
++}
++
++/*======================== End of Routine ============================*/
++
++/* Round up to FFI_SIZEOF_ARG. */
++
++#define STACK_ARG_SIZE(x) ALIGN(x, FFI_SIZEOF_ARG)
++
++/* Perform machine independent initialization of aggregate type
++   specifications. */
++
++static ffi_status initialize_aggregate(ffi_type *arg) {
++  ffi_type **ptr;
++
++  if ((arg == NULL || arg->elements == NULL))
++    return FFI_BAD_TYPEDEF;
++
++  // if not already 0 make 0
++  arg->size = 0;
++  arg->alignment = 0;
++
++  ptr = &(arg->elements[0]);
++
++  if ((ptr == 0))
++    return FFI_BAD_TYPEDEF;
++  int i = 0;
++  while ((*ptr) != NULL) {
++    if (((*ptr)->size == 0) &&
++                 (initialize_aggregate((*ptr)) != FFI_OK))
++      return FFI_BAD_TYPEDEF;
++
++    arg->size = ALIGN(arg->size, (*ptr)->alignment);
++    arg->size += (*ptr)->size;
++
++    arg->alignment = (arg->alignment > (*ptr)->alignment) ? arg->alignment
++                                                          : (*ptr)->alignment;
++    ptr++;
++  }
++
++  arg->size = ALIGN(arg->size, arg->alignment);
++
++  if (arg->size == 0)
++    return FFI_BAD_TYPEDEF;
++  else
++    return FFI_OK;
++}
++
++ffi_status ffi_prep_cif_core(ffi_cif *cif, ffi_abi abi,
++                                        unsigned int isvariadic,
++                                        unsigned int nfixedargs,
++                                        unsigned int ntotalargs,
++                                        ffi_type *rtype, ffi_type **atypes) {
++  
++  
++  unsigned bytes = 0;
++  unsigned int i;
++  ffi_type **ptr;
++
++  FFI_ASSERT(cif != NULL);
++  FFI_ASSERT((!isvariadic) || (nfixedargs >= 1));
++  FFI_ASSERT(nfixedargs <= ntotalargs);
++
++  if (!(abi > FFI_FIRST_ABI && abi < FFI_LAST_ABI))
++    return FFI_BAD_ABI;
++
++  cif->abi = abi;
++  cif->arg_types = atypes;
++  cif->nargs = ntotalargs;
++  cif->rtype = rtype;
++
++  cif->flags = 0;
++
++#if HAVE_LONG_DOUBLE_VARIANT
++  ffi_prep_types(abi);
++#endif
++
++  /* Initialize the return type if necessary */
++  if ((cif->rtype->size == 0) && (initialize_aggregate(cif->rtype) != FFI_OK))
++    return FFI_BAD_TYPEDEF;
++
++  for (ptr = cif->arg_types, i = cif->nargs; i > 0; i--, ptr++) {
++
++    /* Initialize any uninitialized aggregate type definitions */
++    if (((*ptr)->size == 0) && (initialize_aggregate((*ptr)) != FFI_OK))
++      return FFI_BAD_TYPEDEF;
++
++#ifndef FFI_TARGET_HAS_COMPLEX_TYPE
++    if ((*ptr)->type == FFI_TYPE_COMPLEX)
++      abort();
++#endif
++    /* Perform a sanity check on the argument type, do this
++       check after the initialization.  */
++    FFI_ASSERT_VALID_TYPE(*ptr);
++
++#if !defined FFI_TARGET_SPECIFIC_STACK_SPACE_ALLOCATION
++
++    {
++      /* Add any padding if necessary */
++      if (((*ptr)->alignment - 1) & bytes)
++        bytes = (unsigned)ALIGN(bytes, (*ptr)->alignment);
++
++      bytes += STACK_ARG_SIZE((*ptr)->size);
++    }
++#endif
++  }
++
++  cif->bytes = bytes;
++
++  /* Perform machine dependent cif processing */
++#ifdef FFI_TARGET_SPECIFIC_VARIADIC
++  if (isvariadic)
++    return ffi_prep_cif_machdep_var(cif, nfixedargs, ntotalargs);
++#endif
++
++  return ffi_prep_cif_machdep(cif);
++}
++
++ffi_status ffi_prep_cif(ffi_cif *cif, ffi_abi abi, unsigned int nargs,
++                        ffi_type *rtype, ffi_type **atypes) {
++  return ffi_prep_cif_core(cif, abi, 0, nargs, nargs, rtype, atypes);
++}
++
++#if FFI_CLOSURES
++
++ffi_status ffi_prep_closure(ffi_closure *closure, ffi_cif *cif,
++                            void (*fun)(ffi_cif *, void *, void **, void *),
++                            void *user_data) {
++  return ffi_prep_closure_loc(closure, cif, fun, user_data, closure);
++}
++
++#endif
+diff --git a/src/zos/ffi.h b/src/zos/ffi.h
+new file mode 100644
+index 0000000..c2c9f6a
+--- /dev/null
++++ b/src/zos/ffi.h
+@@ -0,0 +1,294 @@
++/*Licensed Materials - Property of IBM
++IBM Open Enterprise SDK for Python 3.11
++5655-PYT
++Copyright IBM Corp. 2022.
++US Government Users Restricted Rights - Use, duplication or disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
++*/
++
++/* -----------------------------------------------------------------*-C-*-
++   libffi 3.2.1 - Copyright (c) 2011, 2014 Anthony Green
++                    - Copyright (c) 1996-2003, 2007, 2008 Red Hat, Inc.
++
++   Permission is hereby granted, free of charge, to any person
++   obtaining a copy of this software and associated documentation
++   files (the ``Software''), to deal in the Software without
++   restriction, including without limitation the rights to use, copy,
++   modify, merge, publish, distribute, sublicense, and/or sell copies
++   of the Software, and to permit persons to whom the Software is
++   furnished to do so, subject to the following conditions:
++
++   The above copyright notice and this permission notice shall be
++   included in all copies or substantial portions of the Software.
++
++   THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND,
++   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++   NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++   DEALINGS IN THE SOFTWARE.
++
++   ----------------------------------------------------------------------- */
++
++/* -------------------------------------------------------------------
++   The basic API is described in the README file.
++
++   The raw API is designed to bypass some of the argument packing
++   and unpacking on architectures for which it can be avoided.
++
++   The closure API allows interpreted functions to be packaged up
++   inside a C function pointer, so that they can be called as C functions,
++   with no understanding on the client side that they are interpreted.
++   It can also be used in other cases in which it is necessary to package
++   up a user specified parameter and a function pointer as a single
++   function pointer.
++
++   The closure API must be implemented in order to get its functionality,
++   e.g. for use by gij.  Routines are provided to emulate the raw API
++   if the underlying platform doesn't allow faster implementation.
++
++   More details on the raw and cloure API can be found in:
++
++   http://gcc.gnu.org/ml/java/1999-q3/msg00138.html
++
++   and
++
++   http://gcc.gnu.org/ml/java/1999-q3/msg00174.html
++   -------------------------------------------------------------------- */
++
++#ifndef LIBFFI_H
++#define LIBFFI_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Specify which architecture libffi is configured for. */
++#ifndef S390
++#define S390
++#endif
++
++#define S390
++#define S390x
++
++
++#include <ffitarget.h>
++#include <stddef.h>
++#include <limits.h>
++
++/* LONG_LONG_MAX is not always defined (not if STRICT_ANSI, for example).
++   But we can find it either under the correct ANSI name, or under GNU
++   C's internal name.  */
++
++#define FFI_64_BIT_MAX 9223372036854775807
++
++#ifdef LONG_LONG_MAX
++# define FFI_LONG_LONG_MAX LONG_LONG_MAX
++#else
++# ifdef LLONG_MAX
++#  define FFI_LONG_LONG_MAX LLONG_MAX
++#  ifdef _AIX52 /* or newer has C99 LLONG_MAX */
++#   undef FFI_64_BIT_MAX
++#   define FFI_64_BIT_MAX 9223372036854775807LL
++#  endif /* _AIX52 or newer */
++# else
++#  ifdef __GNUC__
++#   define FFI_LONG_LONG_MAX __LONG_LONG_MAX__
++#  endif
++#  ifdef _AIX /* AIX 5.1 and earlier have LONGLONG_MAX */
++#   ifndef __PPC64__
++#    if defined (__IBMC__) || defined (__IBMCPP__)
++#     define FFI_LONG_LONG_MAX LONGLONG_MAX
++#    endif
++#   endif /* __PPC64__ */
++#   undef  FFI_64_BIT_MAX
++#   define FFI_64_BIT_MAX 9223372036854775807LL
++#  endif
++# endif
++#endif
++
++/* The closure code assumes that this works on pointers, i.e. a size_t	*/
++/* can hold a pointer.							*/
++
++typedef struct _ffi_type
++{
++  size_t size;
++  unsigned short alignment;
++  unsigned short type;
++  struct _ffi_type **elements;
++} ffi_type;
++
++#ifndef LIBFFI_HIDE_BASIC_TYPES
++#if SCHAR_MAX == 127
++# define ffi_type_uchar                ffi_type_uint8
++# define ffi_type_schar                ffi_type_sint8
++#else
++ #error "char size not supported"
++#endif
++
++#if SHRT_MAX == 32767
++# define ffi_type_ushort       ffi_type_uint16
++# define ffi_type_sshort       ffi_type_sint16
++#elif SHRT_MAX == 2147483647
++# define ffi_type_ushort       ffi_type_uint32
++# define ffi_type_sshort       ffi_type_sint32
++#else
++ #error "short size not supported"
++#endif
++
++#if INT_MAX == 32767
++# define ffi_type_uint         ffi_type_uint16
++# define ffi_type_sint         ffi_type_sint16
++#elif INT_MAX == 2147483647
++# define ffi_type_uint         ffi_type_uint32
++# define ffi_type_sint         ffi_type_sint32
++#elif INT_MAX == 9223372036854775807
++# define ffi_type_uint         ffi_type_uint64
++# define ffi_type_sint         ffi_type_sint64
++#else
++ #error "int size not supported"
++#endif
++
++#if LONG_MAX == 2147483647
++# if FFI_LONG_LONG_MAX != FFI_64_BIT_MAX
++ #error "no 64-bit data type supported"
++# endif
++#elif LONG_MAX != FFI_64_BIT_MAX
++ #error "long size not supported"
++#endif
++
++#if LONG_MAX == 2147483647
++# define ffi_type_ulong        ffi_type_uint32
++# define ffi_type_slong        ffi_type_sint32
++#elif LONG_MAX == FFI_64_BIT_MAX
++# define ffi_type_ulong        ffi_type_uint64
++# define ffi_type_slong        ffi_type_sint64
++#else
++ #error "long size not supported"
++#endif
++
++#define FFI_EXTERN extern
++
++/* These are defined in types.c */
++FFI_EXTERN ffi_type ffi_type_void;
++FFI_EXTERN ffi_type ffi_type_uint8;
++FFI_EXTERN ffi_type ffi_type_sint8;
++FFI_EXTERN ffi_type ffi_type_uint16;
++FFI_EXTERN ffi_type ffi_type_sint16;
++FFI_EXTERN ffi_type ffi_type_uint32;
++FFI_EXTERN ffi_type ffi_type_sint32;
++FFI_EXTERN ffi_type ffi_type_uint64;
++FFI_EXTERN ffi_type ffi_type_sint64;
++FFI_EXTERN ffi_type ffi_type_float;
++FFI_EXTERN ffi_type ffi_type_double;
++FFI_EXTERN ffi_type ffi_type_pointer;
++FFI_EXTERN ffi_type ffi_type_longdouble;
++
++FFI_EXTERN ffi_type ffi_type_complex_float;
++FFI_EXTERN ffi_type ffi_type_complex_double;
++FFI_EXTERN ffi_type ffi_type_complex_longdouble;
++#endif /* LIBFFI_HIDE_BASIC_TYPES */
++
++typedef enum {
++  FFI_OK = 0,
++  FFI_BAD_TYPEDEF,
++  FFI_BAD_ABI
++} ffi_status;
++
++typedef unsigned FFI_TYPE;
++
++typedef struct {
++  ffi_abi abi;
++  unsigned nargs;
++  ffi_type **arg_types;
++  ffi_type *rtype;
++  unsigned bytes;
++  unsigned flags;
++} ffi_cif;
++
++/* Used internally, but overridden by some architectures */
++ffi_status ffi_prep_cif_core(ffi_cif *cif,
++			     ffi_abi abi,
++			     unsigned int isvariadic,
++			     unsigned int nfixedargs,
++			     unsigned int ntotalargs,
++			     ffi_type *rtype,
++			     ffi_type **atypes);
++
++/* ---- Definitions for closures ----------------------------------------- */
++
++typedef struct {
++  char tramp[FFI_TRAMPOLINE_SIZE];
++  ffi_cif   *cif;
++  void     (*fun)(ffi_cif*,void*,void**,void*);
++  void      *user_data;
++} ffi_closure;
++
++void *ffi_closure_alloc (size_t size, void **code);
++void ffi_closure_free (void *);
++
++ffi_status
++ffi_prep_closure (ffi_closure*,
++		  ffi_cif *,
++		  void (*fun)(ffi_cif*,void*,void**,void*),
++		  void *user_data);
++
++ffi_status
++ffi_prep_closure_loc (ffi_closure*,
++		      ffi_cif *,
++		      void (*fun)(ffi_cif*,void*,void**,void*),
++		      void *user_data,
++		      void*codeloc);
++
++
++ffi_status ffi_prep_cif(ffi_cif *cif,
++			ffi_abi abi,
++			unsigned int nargs,
++			ffi_type *rtype,
++			ffi_type **atypes);
++
++ffi_status ffi_prep_cif_var(ffi_cif *cif,
++			    ffi_abi abi,
++			    unsigned int nfixedargs,
++			    unsigned int ntotalargs,
++			    ffi_type *rtype,
++			    ffi_type **atypes);
++
++void ffi_call(ffi_cif *cif,
++	      void (*fn)(void),
++	      void *rvalue,
++	      void **avalue);
++
++/* Useful for eliminating compiler warnings */
++#define FFI_FN(f) ((void (*)(void))f)
++
++/* ---- Definitions shared with assembly code ---------------------------- */
++
++#define FFI_TYPE_VOID       0    
++#define FFI_TYPE_INT        1
++#define FFI_TYPE_FLOAT      2    
++#define FFI_TYPE_DOUBLE     3
++#define FFI_TYPE_LONGDOUBLE 4
++#define FFI_TYPE_UINT8      5   
++#define FFI_TYPE_SINT8      6
++#define FFI_TYPE_UINT16     7 
++#define FFI_TYPE_SINT16     8
++#define FFI_TYPE_UINT32     9
++#define FFI_TYPE_SINT32     10
++#define FFI_TYPE_UINT64     11
++#define FFI_TYPE_SINT64     12
++#define FFI_TYPE_STRUCT     13
++#define FFI_TYPE_POINTER    14
++#define FFI_TYPE_COMPLEX    15
++
++/* This should always refer to the last type code (for sanity checks) */
++#define FFI_TYPE_LAST       FFI_TYPE_COMPLEX
++
++#define FFI_SIZEOF_ARG      8
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/zos/ffi_common.h b/src/zos/ffi_common.h
+new file mode 100644
+index 0000000..18f3d45
+--- /dev/null
++++ b/src/zos/ffi_common.h
+@@ -0,0 +1,83 @@
++/*Licensed Materials - Property of IBM
++IBM Open Enterprise SDK for Python 3.11
++5655-PYT
++Copyright IBM Corp. 2022.
++US Government Users Restricted Rights - Use, duplication or disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
++*/
++
++/* -----------------------------------------------------------------------
++   ffi_common.h - Copyright (c) 1996  Red Hat, Inc.
++
++   Common internal definitions and macros. Only necessary for building
++   libffi.
++   ----------------------------------------------------------------------- */
++
++#ifndef FFI_COMMON_H
++#define FFI_COMMON_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include "fficonfig.h"
++
++/* to include alloca on Z we need stdlib */
++#include <stdlib.h>
++
++#include <string.h>
++
++#ifdef FFI_DEBUG
++#include <stdio.h>
++
++/*@exits@*/ void
++ffi_assert(
++/*@temp@*/	char*	expr,
++/*@temp@*/	char*	file,
++			int		line);
++void
++ffi_stop_here(void);
++void
++ffi_type_test(
++/*@temp@*/ /*@out@*/	ffi_type*	a,
++/*@temp@*/				char*	file,
++						int		line);
++
++#	define FFI_ASSERT(x)			((x) ? (void)0 : ffi_assert(#x, __FILE__,__LINE__))
++#	define FFI_ASSERT_AT(x, f, l)	((x) ? 0 : ffi_assert(#x, (f), (l)))
++#	define FFI_ASSERT_VALID_TYPE(x)	ffi_type_test(x, __FILE__, __LINE__)
++#else
++#	define FFI_ASSERT(x) 
++#	define FFI_ASSERT_AT(x, f, l)
++#	define FFI_ASSERT_VALID_TYPE(x)
++#endif	// #ifdef FFI_DEBUG
++
++#define ALIGN(v, a)	(((size_t)(v) + (a) - 1) & ~((a) - 1))
++
++/*	Perform machine dependent cif processing */
++ffi_status
++ffi_prep_cif_machdep(
++	ffi_cif*	cif);
++
++/*	Extended cif, used in callback from assembly routine */
++typedef struct	extended_cif {
++/*@dependent@*/	ffi_cif*	cif;
++/*@dependent@*/	void*		rvalue;
++/*@dependent@*/	void**		avalue;
++} extended_cif;
++
++/*	Terse sized type definitions.  */
++typedef unsigned int	UINT8	__attribute__((__mode__(__QI__)));
++typedef signed int		SINT8	__attribute__((__mode__(__QI__)));
++typedef unsigned int	UINT16	__attribute__((__mode__(__HI__)));
++typedef signed int		SINT16	__attribute__((__mode__(__HI__)));
++typedef unsigned int	UINT32	__attribute__((__mode__(__SI__)));
++typedef signed int		SINT32	__attribute__((__mode__(__SI__)));
++typedef unsigned int	UINT64	__attribute__((__mode__(__DI__)));
++typedef signed int		SINT64	__attribute__((__mode__(__DI__)));
++typedef float			FLOAT32;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif	// #ifndef FFI_COMMON_H
+diff --git a/src/zos/ffitarget.h b/src/zos/ffitarget.h
+new file mode 100644
+index 0000000..4477260
+--- /dev/null
++++ b/src/zos/ffitarget.h
+@@ -0,0 +1,72 @@
++/*Licensed Materials - Property of IBM
++IBM Open Enterprise SDK for Python 3.11
++5655-PYT
++Copyright IBM Corp. 2022.
++US Government Users Restricted Rights - Use, duplication or disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
++*/
++
++/* -----------------------------------------------------------------*-C-*-
++   ffitarget.h - Copyright (c) 2012  Anthony Green
++                 Copyright (c) 1996-2003  Red Hat, Inc.
++   Target configuration macros for S390.
++
++   Permission is hereby granted, free of charge, to any person obtaining
++   a copy of this software and associated documentation files (the
++   ``Software''), to deal in the Software without restriction, including
++   without limitation the rights to use, copy, modify, merge, publish,
++   distribute, sublicense, and/or sell copies of the Software, and to
++   permit persons to whom the Software is furnished to do so, subject to
++   the following conditions:
++
++   The above copyright notice and this permission notice shall be included
++   in all copies or substantial portions of the Software.
++
++   THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND,
++   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++   NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++   DEALINGS IN THE SOFTWARE.
++
++   ----------------------------------------------------------------------- */
++
++#ifndef LIBFFI_TARGET_H
++#define LIBFFI_TARGET_H
++
++#ifndef LIBFFI_H
++#error "Please do not include ffitarget.h directly into your source.  Use ffi.h instead."
++#endif
++
++#if defined (__s390x__)
++#ifndef S390X
++#define S390X
++#endif
++#endif
++
++/* ---- System specific configurations ----------------------------------- */
++
++#ifndef LIBFFI_ASM
++typedef unsigned long          ffi_arg;
++typedef signed long            ffi_sarg;
++
++typedef enum ffi_abi {
++  FFI_FIRST_ABI = 0,
++  FFI_XPLINK,
++  FFI_LAST_ABI,
++  FFI_DEFAULT_ABI = FFI_XPLINK,
++} ffi_abi;
++#endif
++
++/* ---- Definitions for closures ----------------------------------------- */
++
++#define FFI_CLOSURES 1
++
++//TODO: Fix this for operating outside of Amode64
++#define FFI_TRAMPOLINE_SIZE 2048
++
++#endif
++
++
++#define UNLIKELY(x) x
+diff --git a/src/zos/types.c b/src/zos/types.c
+new file mode 100644
+index 0000000..2d6d478
+--- /dev/null
++++ b/src/zos/types.c
+@@ -0,0 +1,107 @@
++#include "copyright.h"
++/* -----------------------------------------------------------------------
++   types.c - Copyright (c) 1996, 1998  Red Hat, Inc.
++   
++   Predefined ffi_types needed by libffi.
++
++   Permission is hereby granted, free of charge, to any person obtaining
++   a copy of this software and associated documentation files (the
++   ``Software''), to deal in the Software without restriction, including
++   without limitation the rights to use, copy, modify, merge, publish,
++   distribute, sublicense, and/or sell copies of the Software, and to
++   permit persons to whom the Software is furnished to do so, subject to
++   the following conditions:
++
++   The above copyright notice and this permission notice shall be included
++   in all copies or substantial portions of the Software.
++
++   THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND,
++   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++   NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++   DEALINGS IN THE SOFTWARE.
++   ----------------------------------------------------------------------- */
++
++/* Hide the basic type definitions from the header file, so that we
++   can redefine them here as "const".  */
++#define LIBFFI_HIDE_BASIC_TYPES
++
++#include <ffi.h>
++#include <ffi_common.h>
++
++/* Type definitions */
++
++#define FFI_TYPEDEF(name, type, id, maybe_const)\
++struct struct_align_##name {			\
++  char c;					\
++  type x;					\
++};						\
++maybe_const ffi_type ffi_type_##name = {	\
++  sizeof(type),					\
++  offsetof(struct struct_align_##name, x),	\
++  id, NULL					\
++}
++
++#define FFI_COMPLEX_TYPEDEF(name, type, maybe_const)	\
++static ffi_type *ffi_elements_complex_##name [2] = {	\
++	(ffi_type *)(&ffi_type_##name), NULL		\
++};							\
++struct struct_align_complex_##name {			\
++  char c;						\
++  _Complex type x;					\
++};							\
++maybe_const ffi_type ffi_type_complex_##name = {	\
++  sizeof(_Complex type),				\
++  offsetof(struct struct_align_complex_##name, x),	\
++  FFI_TYPE_COMPLEX,					\
++  (ffi_type **)ffi_elements_complex_##name		\
++}
++
++/* Size and alignment are fake here. They must not be 0. */
++const ffi_type ffi_type_void = {
++  1, 1, FFI_TYPE_VOID, NULL
++};
++
++FFI_TYPEDEF(uint8, UINT8, FFI_TYPE_UINT8, const);
++FFI_TYPEDEF(sint8, SINT8, FFI_TYPE_SINT8, const);
++FFI_TYPEDEF(uint16, UINT16, FFI_TYPE_UINT16, const);
++FFI_TYPEDEF(sint16, SINT16, FFI_TYPE_SINT16, const);
++FFI_TYPEDEF(uint32, UINT32, FFI_TYPE_UINT32, const);
++FFI_TYPEDEF(sint32, SINT32, FFI_TYPE_SINT32, const);
++FFI_TYPEDEF(uint64, UINT64, FFI_TYPE_UINT64, const);
++FFI_TYPEDEF(sint64, SINT64, FFI_TYPE_SINT64, const);
++
++FFI_TYPEDEF(pointer, void*, FFI_TYPE_POINTER, const);
++
++FFI_TYPEDEF(float, float, FFI_TYPE_FLOAT, const);
++FFI_TYPEDEF(double, double, FFI_TYPE_DOUBLE, const);
++
++#if !defined HAVE_LONG_DOUBLE_VARIANT || defined __alpha__
++#define FFI_LDBL_CONST const
++#else
++#define FFI_LDBL_CONST
++#endif
++
++#ifdef __alpha__
++/* Even if we're not configured to default to 128-bit long double, 
++   maintain binary compatibility, as -mlong-double-128 can be used
++   at any time.  */
++/* Validate the hard-coded number below.  */
++# if defined(__LONG_DOUBLE_128__) && FFI_TYPE_LONGDOUBLE != 4
++#  error FFI_TYPE_LONGDOUBLE out of date
++# endif
++const ffi_type ffi_type_longdouble = { 16, 16, 4, NULL };
++#elif FFI_TYPE_LONGDOUBLE != FFI_TYPE_DOUBLE
++FFI_TYPEDEF(longdouble, long double, FFI_TYPE_LONGDOUBLE, FFI_LDBL_CONST);
++#endif
++
++#ifdef FFI_TARGET_HAS_COMPLEX_TYPE
++FFI_COMPLEX_TYPEDEF(float, float, const);
++FFI_COMPLEX_TYPEDEF(double, double, const);
++#if FFI_TYPE_LONGDOUBLE != FFI_TYPE_DOUBLE
++FFI_COMPLEX_TYPEDEF(longdouble, long double, FFI_LDBL_CONST);
++#endif
++#endif
+diff --git a/src/zos/xplink.s b/src/zos/xplink.s
+new file mode 100644
+index 0000000..081959f
+--- /dev/null
++++ b/src/zos/xplink.s
+@@ -0,0 +1,596 @@
++         ACONTROL AFPR,FLAG(CONT)
++
++FFIXPLINK CELQPRLG DSASIZE=DSASZ,PSECT=ASP
++
++*        Incoming args fn, &ecif, 
++*        cif->flags, ecif.rvalue, 
++*        cif->bytes, cif->nargs, (*cif->arg_types)->size
++*        r1 = fn (ptr) + 0
++*        r2 = ecif (ptr) + 8
++*        r3 = cif->flags + 16
++*        stack argument area
++*        ecif.rvalue (ptr) + 24
++*        cif->bytes + 32
++*        cif->nargs + 36
++*        (*cif->arg_types)->size + 40 
++
++         USING  CEEDSAHP,4
++
++         LA 9,0(,1)
++         LA 11,0(,2)
++         LA 14,0(,3)
++
++         LA 1,0(,4)
++         LA 3,(2176)(,4)
++
++         LA 1,LSTOR
++         LGR 13,1
++
++         CELQCALL   PREPARGS,WORKREG=10
++
++         LA 1,0(,9)
++         LA 2,0(,11)
++         LA 3,0(,14)
++
++         LGR 12,14
++
++
++         LA  1,0
++         LA  0,0
++         LA  6,0  * number of free FPRs
++         LA  7,0  * current index in ffi arglist
++         LA  10,0 * number of free GPRs
++         LA  13,0  * number of args
++         LA  14,0  * offset into xplink argument area
++
++
++*        values = (2176+(((DSASZ+31)/32)*32)+88)(,4)
++*        values+1 = (2176+(((DSASZ+31)/32)*32)+80)(,4)
++*        cif->nargs into register 9(Work register)
++
++         LG 12,0(,2)           ecif->cif
++         L 13,4(,12)
++         SLL 13,3
++*        determine if the return is a struct that needs a ptr
++         L 1,28(,12)
++
++         LG 12,8(,12)           cif->arg_types
++
++*        determine if the return is a struct that needs a ptr
++         LA 0,9
++         CGRJNE 1,0,NEXTARG2
++         
++RETSTRUCT DS 0H if needed make sure to load return address into r1
++         LG 1,(ARGLIST+24)(,4)
++         AFI 10,8
++         AFI 14,8
++
++
++NEXTARG2 DS 0H
++         
++         CGRJE 13,7,CALL
++         LG  11,0(7,12)       Get pointer to current ffi_type
++         LGH 11,10(,11)      ffi_type->type
++         SLL 11,2            Find offset in branch tabel
++         LA  15,ARGTABLE        
++         L   15,0(11,15)
++         BR  15
++
++NEXTARG DS 0H
++
++        AGHI 7,8
++        B NEXTARG2
++
++STRUCT   DS 0H
++         LG  11,0(7,12)       Get pointer to current ffi_type
++         LG  11,0(,11)        ffi_type->size
++        
++         CGIJNL 11,17,GPRSTRUCT123 *if greater than 3 registers     
++         CGIJNL 11,9,GPR2STRUCT12
++         B POINTER
++
++* we want >=3 gprs for arg1
++GPRSTRUCT123 DS 0H
++         
++* do we have space?
++         CGIJH 10,0,GPRSTRUCT23
++* load r
++* load r2
++* load r3
++         LG 9,(ARGLIST+88)(,4)
++         LG 3,0(7,9)
++         LG 1,0(,3)
++         LG 2,8(,3)
++         LG 3,16(,3)
++         AFI 10,24
++         AFI 14,24
++         B NEXTARG
++
++GPRSTRUCT23 DS 0H
++
++* do we have space?
++         CGIJH 10,8,GPRSTRUCT3
++
++* load r2
++* load r3
++         LG 9,(ARGLIST+88)(,4)
++         LG 3,0(7,9)
++         LG 2,0(,3)
++         LG 3,8(,3)
++         AFI 10,16
++         AFI 14,16
++         B NEXTARG
++
++GPRSTRUCT3 DS 0H
++         
++* do we have space?
++         CGIJH 10,16,NEXTARG
++
++* load r3
++         LG 9,(ARGLIST+88)(,4)
++         LG 3,0(7,9)
++         LG 3,0(,3)
++         AFI 10,8
++         AFI 14,8
++         B NEXTARG
++
++
++* we want 2 gprs for arg1
++GPR2STRUCT12 DS 0H
++         
++* do we have space?
++         CGIJH 10,0,GPR2STRUCT23
++* load r
++* load r2
++* load r3
++         LG 9,(ARGLIST+88)(,4)
++         LG 2,0(7,9)
++         LG 1,0(,2)
++         LG 2,8(,2)
++         AFI 10,16
++         AFI 14,16
++         B NEXTARG
++
++GPR2STRUCT23 DS 0H
++
++* do we have space?
++         CGIJH 10,8,GPR2STRUCT3
++
++* load r2
++* load r3
++         LG 9,(ARGLIST+88)(,4)
++         LG 3,0(7,9)
++         LG 2,0(,3)
++         LG 3,8(,3)
++         AFI 10,8
++         AFI 14,8
++         B NEXTARG
++
++GPR2STRUCT3 DS 0H
++
++* do we have space?
++         CGIJH 10,16,NEXTARG
++
++* load r2
++* load r3
++         LG 9,(ARGLIST+88)(,4)
++         LG 3,0(7,9)
++         LG 3,0(,3)
++         AFI 10,8
++         AFI 14,8
++         B NEXTARG
++
++UINT64 DS 0H
++SINT64 DS 0H
++POINTER DS 0H
++         CGIBNL 10,24,NEXTARG
++         LA  15,GPRTABLE32
++         L   15,0(10,15)
++         BR  15
++
++ARG1GPR64 DS 0H
++
++         LA 9,(2176)(,4)
++         LG 1,0(14,9)
++         AFI 10,8
++         AFI 14,8
++         B NEXTARG
++
++ARG2GPR64 DS 0H
++
++         LA 9,(2176)(,4)
++         LG 2,0(14,9)
++         AFI 10,8
++         AFI 14,8
++         B NEXTARG
++
++ARG3GPR64 DS 0H
++
++         LA 9,(2176)(,4)
++         LG 3,0(14,9)
++         AFI 10,8
++         AFI 14,8
++         B NEXTARG
++
++
++ARGMEM64 DS 0H
++         LA 9,(ARGLIST+88)(,4)
++         LG 9,0(14,9)
++         L 9,0(9)
++         STG 9,(2176)(14,4)
++         AFI 10,8
++         AFI 14,8
++         AFI 7,8
++         B NEXTARG
++
++SINT32   DS 0H
++UINT32   DS 0H
++INT      DS 0H
++
++         CGIBNL 10,24,NEXTARG
++         LA  15,GPRTABLE32
++         L   15,0(10,15)
++         BR  15
++
++ARG1GPR32 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 1,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARG2GPR32 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 2,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARG3GPR32 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 3,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARGMEM32 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(14,9)
++         L 9,0(9)
++         STG 9,(2176)(14,4)
++         AFI 14,4
++         B NEXTARG
++
++SINT16   DS 0H
++UINT16   DS 0H
++
++         CGIBNL 10,24,NEXTARG
++         LA  15,GPRTABLE16
++         L   15,0(10,15)
++         BR  15
++
++ARG1GPR16 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 1,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARG2GPR16 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 2,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARG3GPR16 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 3,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARGMEM16 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(14,9)
++         LH 9,0(9)
++         STG 9,(2176)(14,4)
++         AFI 14,2
++         B NEXTARG
++
++SINT8   DS 0H
++UINT8   DS 0H
++
++         CGIBNL 10,24,NEXTARG
++         LA  15,GPRTABLE8
++         L   15,0(10,15)
++         BR  15
++
++ARG1GPR8 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 1,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARG2GPR8 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 2,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARG3GPR8 DS 0H
++         
++         LA 9,(2176)(,4)
++         LG 3,0(14,9)
++         AFI 14,8
++         AFI 10,8
++         B NEXTARG
++
++ARGMEM8 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(14,9)
++         LH 9,0(9)
++         STG 9,(2176)(14,4)
++         AFI 14,1
++         B NEXTARG
++
++
++FLOAT DS 0H
++* check if we're out of FPRs
++         CGIBNL 6,32,NEXTARG
++         LA 15,FPRTABLE
++         L  15,0(6,15)
++         BR  15
++
++ARG0FPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 0,0(,9)
++         AFI 6,8
++         B NEXTARG
++
++ARG2FPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 2,0(,9)
++         AFI 6,8
++         B NEXTARG
++ARG4FPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 4,0(,9)
++         AFI 6,8
++         B NEXTARG
++ARG6FPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 6,0(,9)
++         AFI 6,8
++         B NEXTARG
++ARGMEMFP DS 0H
++         B NEXTARG
++
++DOUBLE DS 0H
++         CGIBNL 6,32,NEXTARG
++         LA 15,FPRTABLE
++         L  15,0(6,15)
++         BR  15
++         B NEXTARG
++
++ARG0DFPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 0,0(,9)
++         AFI 6,8
++         B NEXTARG
++ARG2DFPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 2,0(,9)
++         AFI 6,8
++         B NEXTARG
++ARG4DFPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 4,0(,9)
++         AFI 6,8
++         B NEXTARG
++ARG6DFPR64 DS 0H
++         LG 9,(ARGLIST+88)(,4)
++         LG 9,0(7,9)
++         LD 6,0(,9)
++         AFI 6,8
++         B NEXTARG
++ARGMEMDFP DS 0H
++         B NEXTARG
++
++* for when arg is void
++VOID     DS 0H
++CALL     DS 0H
++*        load functionn ptr
++         LG 6,(ARGLIST)(,4)
++         
++         LMG 5,6,0(6)
++
++         BASR 7,6
++         DC    X'0700'          
++
++* Prep for return
++
++
++         LA 11,0 
++         L 11,(ARGLIST+20)(,4)
++         
++         LA 15,RTABLE
++         SLL 11,2             Return type *8 for index
++
++         LGF 15,0(11,15)
++          
++          
++*        load cif->rvalue to be stored
++         LG 7,(ARGLIST+24)(,4)
++
++         BR 15 branch too correct return type    
++
++         
++RPTR     DS 0H
++RINT64   DS 0H
++RINT32   DS 0H Probably endianess assumptions
++RINT16   DS 0H SHOULDNT BE HERE
++RINT8    DS 0H BUT PYTHON DIES WITHOUT IT
++         STG 3,0(,7)
++         B RET
++
++
++* This is where r32int shoud be
++* RINT32   DS 0H
++       STG 1,0(,7)
++       AR 0,1
++       LGFR 3,0
++       B RET
++
++
++* RINT16   DS 0H
++         STH 3,0(,7)
++         B RET
++
++* RINT8    DS 0H
++         STC 3,0(,7)
++         B RET
++
++RFLOAT   DS 0H
++         STE 0,0(,7)
++         B RET
++
++* check em
++RDUB     DS 0H
++         STD 0,0(,7)
++         B RET
++
++RLDUB    DS 0H
++         STD 0,0(,7)
++         STD 2,8(,7)
++         B RET
++
++RMEMSTRUCT DS 0H
++         B RET
++
++RSTRUCT  DS 0H
++         STG 1,0(,7)
++         STG 2,8(,7)
++         B RET
++
++RVOID    DS 0H
++RET      DS 0H 
++         CELQEPLG
++
++
++*Table of labels to load arguments
++ARGTABLE DC A(VOID)
++ DC A(INT)
++ DC A(FLOAT)
++ DC A(DOUBLE)
++ DC A(LONGDOUBLE)
++ DC A(UINT8) 
++ DC A(SINT8)
++ DC A(UINT16) 
++ DC A(SINT16)
++ DC A(UINT32) 
++ DC A(SINT32)
++ DC A(UINT64) 
++ DC A(SINT64) 
++ DC A(STRUCT)
++ DC A(POINTER)
++ DC A(COMPLEX)
++
++LONGDOUBLE DS 0H
++COMPLEX DS 0H
++
++GPRTABLE64 DC A(ARG1GPR64)
++ DC A(ARG1GPR64)
++ DC A(ARG2GPR64)
++ DC A(ARG2GPR64)
++ DC A(ARG3GPR64)
++ DC A(ARG3GPR64)
++ DC A(ARGMEM64)
++ DC A(ARGMEM64)
++
++GPRTABLE32 DC A(ARG1GPR32)
++ DC A(ARG1GPR32)
++ DC A(ARG2GPR32)
++ DC A(ARG2GPR32)
++ DC A(ARG3GPR32)
++ DC A(ARG3GPR32)
++ DC A(ARGMEM32)
++ DC A(ARGMEM32)
++
++GPRTABLE16 DC A(ARG1GPR16)
++ DC A(ARG1GPR16)
++ DC A(ARG2GPR16)
++ DC A(ARG2GPR16)
++ DC A(ARG3GPR16)
++ DC A(ARG3GPR16)
++ DC A(ARGMEM16)
++ DC A(ARGMEM16)
++
++GPRTABLE8 DC A(ARG1GPR8)
++ DC A(ARG1GPR8)
++ DC A(ARG2GPR8)
++ DC A(ARG2GPR8)
++ DC A(ARG3GPR8)
++ DC A(ARG3GPR8)
++ DC A(ARGMEM8)
++ DC A(ARGMEM8)
++
++FPRTABLE DC A(ARG0FPR64)
++ DC A(ARG0FPR64)
++ DC A(ARG2FPR64)
++ DC A(ARG2FPR64)
++ DC A(ARG4FPR64)
++ DC A(ARG4FPR64)
++ DC A(ARG6FPR64)
++ DC A(ARG6FPR64)
++ DC A(ARGMEMFP)
++ DC A(ARGMEMFP)
++
++DFPRTABLE DC A(ARG0DFPR64)
++ DC A(ARG0DFPR64)
++ DC A(ARG2DFPR64)
++ DC A(ARG2DFPR64)
++ DC A(ARG4DFPR64)
++ DC A(ARG4DFPR64)
++ DC A(ARG6DFPR64)
++ DC A(ARG6DFPR64)
++ DC A(ARGMEMDFP)
++ DC A(ARGMEMDFP)
++
++*Table of labels to return data
++RTABLE DC A(RVOID)
++ DC A(RSTRUCT)
++ DC A(RFLOAT)
++ DC A(RDUB)
++ DC A(RLDUB)
++ DC A(RINT32)
++ DC A(RINT64) * long, ptr and signed long
++ DC A(RINT16)
++ DC A(RINT8)
++ DC A(RMEMSTRUCT)
++ 
++CEEDSAHP CEEDSA SECTYPE=XPLINK
++* arglist 
++ARGLIST  EQU (2176+(((DSASZ+31)/32)*32))
++ARGLIST2 EQU (2176+(((DSASZ+31)/32)*32)+88)
++ARGSL DS  XL800
++DSASZ    EQU (*-CEEDSAHP_FIXED)
++LSTOR DS  XL800
++ END FFIXPLINK

@@ -16,9 +16,9 @@ export ZOPEN_BUILD_LINE="STABLE"
 
 ## Required IF ZOPEN_BUILD_LINE='STABLE'
 export ZOPEN_STABLE_URL="https://github.com/GNOME/glib.git"
-export ZOPEN_STABLE_DEPS="zoslib make bison meson ninja pkgconfig check_python libpcre2 flex zlib" # Specify the stable build dependencies.
+export ZOPEN_STABLE_DEPS="zoslib make bison meson ninja pkgconfig check_python libpcre2 flex zlib coreutils" # Specify the stable build dependencies.
 
-export ZOPEN_CONFIGURE="meson_build"
+export ZOPEN_CONFIGURE="meson_configure"
 
 ## Required IF ZOPEN_BUILD_LINE='DEV'
 export ZOPEN_DEV_URL=""   # Specify the dev build URL
@@ -44,12 +44,17 @@ export ZOPEN_SYSTEM_PREREQ=""
 #export ZOPEN_CHECK="skip"     ## Check program to run (defaults to 'make')
 #export ZOPEN_CONFIGURE="skip" ## Configuration program to run (defaults to './configure')
 #export ZOPEN_INSTALL="skip"   ## Installation program to run (defaults to 'make')
-#export ZOPEN_MAKE="skip"      ## Build program to run (defaults to 'make')
+export ZOPEN_MAKE="meson_build"      ## Build program to run (defaults to 'make')
 #export ZOPEN_CLEAN=""         ## Clean up program to run (defaults to 'make')
+
+meson_configure()
+{
+  MESON_FORCE_BACKTRACE=1 meson setup --default-library=static ../build --reconfigure -Dc_std=gnu11 -Dxattr=false -Dselinux=disabled
+}
 
 meson_build()
 {
-  MESON_FORCE_BACKTRACE=1 meson setup --default-library=static _build 
+  meson compile -C ../build
 }
 
 
@@ -107,10 +112,12 @@ zopen_get_version()
   ## which can be used to set environment variables before main is run.
 #}
 
-#zopen_init(){
+zopen_init(){
   ## This function runs after code is downloaded and patched but before the code
   ## is built.
-#}
+  mkdir -p subprojects/packagefiles
+  cp -rf ../libffi-patches/ subprojects/packagefiles/
+}
 
 #zopen_post_buildenv(){
   ## This function runs after the 'buildenv' is processed.
@@ -136,9 +143,11 @@ zopen_get_version()
   ## This function runs after the 'install' step of the build is run.
 #}
 
-#zopen_pre_patch(){
-  ## This function runs before the 'patch' step of the build is run.
-#}
+zopen_pre_patch(){
+#  ## This function runs before the 'patch' step of the build is run.
+  export CFLAGS="$CPPFLAGS $CFLAGS"
+  export LDFLAGS="$LDFLAGS $LIBS"
+}
 
 #zopen_pre_terminate(){
   ## This function runs before 'zopen build' terminates.
@@ -149,8 +158,8 @@ zopen_get_version()
 ### Optional build control variables
 ###
 
-#export ZOPEN_EXTRA_CFLAGS="" ## C compiler flags to append to CFLAGS (defaults to '').
-#export ZOPEN_EXTRA_CPPFLAGS="" ## C,C++ pre-processor flags to append to CPPFLAGS (defaults to '')
+export ZOPEN_EXTRA_CFLAGS="-UZOSLIB_USE_CLIB_LOCALE" ## C compiler flags to append to CFLAGS (defaults to '').
+export ZOPEN_EXTRA_CPPFLAGS="-D__XPLAT=1 -D_POSIX_C_SOURCE=200809L -DO_CLOEXEC=0" ## C,C++ pre-processor flags to append to CPPFLAGS (defaults to '')
 #export ZOPEN_EXTRA_CXXFLAGS="" ## C++ compiler flags to append to CXXFLAGS (defaults to '')
 #export ZOPEN_EXTRA_LDFLAGS="" ## C,C++ linker flags to append to LDFLAGS (defaults to '')
 #export ZOPEN_EXTRA_LIBS="" ## C,C++ libraries to append to LIBS (defaults to '')
@@ -159,11 +168,11 @@ zopen_get_version()
 #export ZOPEN_CHECK_OPTS="" ## Options to pass to check program (defaults to 'check')
 #export ZOPEN_CHECK_TIMEOUT="" ## Timeout limit in seconds for the check program (defaults to '12600' # 3.5 hours)
 #export ZOPEN_CLEAN_OPTS="" ## Options to pass to clean up  program (defaults to 'clean')
-#export ZOPEN_CONFIGURE_MINIMAL="" ## Configuration program will not be passed CFLAGS, LDFLAGS, CPPFLAGS options but will get them from env vars.
+export ZOPEN_CONFIGURE_MINIMAL="y" ## Configuration program will not be passed CFLAGS, LDFLAGS, CPPFLAGS options but will get them from env vars.
 #export ZOPEN_CONFIGURE_OPTS="" ## Options to pass to configuration program (defaults to '--prefix=')
 #export ZOPEN_EXTRA_CONFIGURE_OPTS="" ## Extra configure options to pass to configuration program. (defaults to '')
 #export ZOPEN_INSTALL_OPTS="" ## Options to pass to installation program (defaults to 'install')
-#export ZOPEN_MAKE_MINIMAL="" ## Build program will not be passed CFLAGS, LDFLAGS, CPPFLAGS options but will get them from env vars.
+export ZOPEN_MAKE_MINIMAL="y" ## Build program will not be passed CFLAGS, LDFLAGS, CPPFLAGS options but will get them from env vars.
 #export ZOPEN_MAKE_OPTS="" ## Options to pass to build program (defaults to '-j')
 #export ZOPEN_PATCH_DIR="" ## Specify directory from which patches should be applied.
 
