@@ -1,7 +1,7 @@
 # Update bump details accordingly. Use bump check to confirm.
-# bump: glib-version /GLIB_VERSION="(.*)"/ https://download.gnome.org/sources/glib/2.84/glib-2.84.3.tar.xz|semver:*
-# GLIB_VERSION="V.R.M" # Specify a stable release
-# export ZOPEN_STABLE_TAG="v${GLIB_VERSION}"
+# bump: glib-version /GLIB_VERSION="(.*)"/ https://github.com/GNOME/glib.git|re:/\b\d+\.\d+\.\d+\b/|semver:*
+GLIB_VERSION="2.85.2" # Specify a stable release
+export ZOPEN_STABLE_TAG="${GLIB_VERSION}"
 
 ###
 ### Build control file for the glib port
