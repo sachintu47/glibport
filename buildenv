@@ -16,7 +16,7 @@ export ZOPEN_BUILD_LINE="STABLE"
 
 ## Required IF ZOPEN_BUILD_LINE='STABLE'
 export ZOPEN_STABLE_URL="https://github.com/GNOME/glib.git"
-export ZOPEN_STABLE_DEPS="zoslib make bison meson ninja pkgconfig check_python libpcre2 flex zlib coreutils" # Specify the stable build dependencies.
+export ZOPEN_STABLE_DEPS="zoslib make bison meson ninja pkgconfig check_python libpcre2 flex zlib coreutils patch" # Specify the stable build dependencies.
 
 export ZOPEN_CONFIGURE="meson_configure"
 
@@ -49,7 +49,7 @@ export ZOPEN_MAKE="meson_build"      ## Build program to run (defaults to 'make'
 
 meson_configure()
 {
-  MESON_FORCE_BACKTRACE=1 meson setup --default-library=static ../build --reconfigure -Dc_std=gnu11 -Dxattr=false -Dselinux=disabled -Db_sanitize=none -Dtests=false
+  MESON_FORCE_BACKTRACE=1 meson setup --default-library=static ../build --reconfigure -Dc_std=gnu11 -Dxattr=false -Dselinux=disabled
 }
 
 meson_build()

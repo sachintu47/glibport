@@ -1,8 +1,212 @@
-diff --git a/meson.build b/meson.build
-index ae7d0aa..baf6133 100644
---- a/meson.build
-+++ b/meson.build
-@@ -253,8 +253,16 @@ elif host_cpu_family == 'riscv64'
+diff -uNr '--exclude=.git' libffi/include/ffi_common.h subprojects/libffi/include/ffi_common.h
+--- libffi/include/ffi_common.h	2025-08-06 03:13:04 -0400
++++ subprojects/libffi/include/ffi_common.h	2025-08-06 03:11:13 -0400
+@@ -1,8 +1,13 @@
++/*Licensed Materials - Property of IBM
++IBM Open Enterprise SDK for Python 3.11
++5655-PYT
++Copyright IBM Corp. 2022.
++US Government Users Restricted Rights - Use, duplication or disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
++*/
++
+ /* -----------------------------------------------------------------------
+-   ffi_common.h - Copyright (C) 2011, 2012, 2013  Anthony Green
+-                  Copyright (C) 2007  Free Software Foundation, Inc
+-                  Copyright (c) 1996  Red Hat, Inc.
+-                  
++   ffi_common.h - Copyright (c) 1996  Red Hat, Inc.
++
+    Common internal definitions and macros. Only necessary for building
+    libffi.
+    ----------------------------------------------------------------------- */
+@@ -14,134 +19,65 @@
+ extern "C" {
+ #endif
+ 
+-#include <fficonfig.h>
++#include "fficonfig.h"
+ 
+-/* Do not move this. Some versions of AIX are very picky about where
+-   this is positioned. */
+-#ifdef __GNUC__
+-# if HAVE_ALLOCA_H
+-#  include <alloca.h>
+-# else
+-  /* mingw64 defines this already in malloc.h. */
+-#  ifndef alloca
+-#    define alloca __builtin_alloca
+-#  endif
+-# endif
+-# define MAYBE_UNUSED __attribute__((__unused__))
+-#else
+-# define MAYBE_UNUSED
+-# if HAVE_ALLOCA_H
+-#  include <alloca.h>
+-# else
+-#  ifdef _AIX
+-#   pragma alloca
+-#  else
+-#   ifndef alloca /* predefined by HP cc +Olibcalls */
+-#    ifdef _MSC_VER
+-#     define alloca _alloca
+-#    else
+-char *alloca ();
+-#   endif
+-#  endif
+-# endif
+-# endif
+-#endif
++/* to include alloca on Z we need stdlib */
++#include <stdlib.h>
+ 
+-/* Check for the existence of memcpy. */
+-#if HAVE_MEMCPY
+-# include <string.h>
+-#else
+-# define memcpy(d, s, n) bcopy ((s), (d), (n))
+-#endif
++#include <string.h>
+ 
+-#if defined(FFI_DEBUG)
++#ifdef FFI_DEBUG
+ #include <stdio.h>
+-#endif
+ 
+-#ifdef FFI_DEBUG
+-void ffi_assert(char *expr, char *file, int line);
+-void ffi_stop_here(void);
+-void ffi_type_test(ffi_type *a, char *file, int line);
+-
+-#define FFI_ASSERT(x) ((x) ? (void)0 : ffi_assert(#x, __FILE__,__LINE__))
+-#define FFI_ASSERT_AT(x, f, l) ((x) ? 0 : ffi_assert(#x, (f), (l)))
+-#define FFI_ASSERT_VALID_TYPE(x) ffi_type_test (x, __FILE__, __LINE__)
++/*@exits@*/ void
++ffi_assert(
++/*@temp@*/	char*	expr,
++/*@temp@*/	char*	file,
++			int		line);
++void
++ffi_stop_here(void);
++void
++ffi_type_test(
++/*@temp@*/ /*@out@*/	ffi_type*	a,
++/*@temp@*/				char*	file,
++						int		line);
++
++#	define FFI_ASSERT(x)			((x) ? (void)0 : ffi_assert(#x, __FILE__,__LINE__))
++#	define FFI_ASSERT_AT(x, f, l)	((x) ? 0 : ffi_assert(#x, (f), (l)))
++#	define FFI_ASSERT_VALID_TYPE(x)	ffi_type_test(x, __FILE__, __LINE__)
+ #else
+-#define FFI_ASSERT(x)
+-#define FFI_ASSERT_AT(x, f, l)
+-#define FFI_ASSERT_VALID_TYPE(x)
+-#endif
+-
+-/* v cast to size_t and aligned up to a multiple of a */
+-#define FFI_ALIGN(v, a)  (((((size_t) (v))-1) | ((a)-1))+1)
+-/* v cast to size_t and aligned down to a multiple of a */
+-#define ALIGN_DOWN(v, a) (((size_t) (v)) & -a)
+-
+-/* Perform machine dependent cif processing */
+-ffi_status ffi_prep_cif_machdep(ffi_cif *cif);
+-ffi_status ffi_prep_cif_machdep_var(ffi_cif *cif,
+-	 unsigned int nfixedargs, unsigned int ntotalargs);
+-
+-
+-#if HAVE_LONG_DOUBLE_VARIANT
+-/* Used to adjust size/alignment of ffi types.  */
+-void ffi_prep_types (ffi_abi abi);
+-#endif
+-
+-/* Used internally, but overridden by some architectures */
+-ffi_status ffi_prep_cif_core(ffi_cif *cif,
+-			     ffi_abi abi,
+-			     unsigned int isvariadic,
+-			     unsigned int nfixedargs,
+-			     unsigned int ntotalargs,
+-			     ffi_type *rtype,
+-			     ffi_type **atypes);
+-
+-/* Extended cif, used in callback from assembly routine */
+-typedef struct
+-{
+-  ffi_cif *cif;
+-  void *rvalue;
+-  void **avalue;
++#	define FFI_ASSERT(x) 
++#	define FFI_ASSERT_AT(x, f, l)
++#	define FFI_ASSERT_VALID_TYPE(x)
++#endif	// #ifdef FFI_DEBUG
++
++#define ALIGN(v, a)	(((size_t)(v) + (a) - 1) & ~((a) - 1))
++
++/*	Perform machine dependent cif processing */
++ffi_status
++ffi_prep_cif_machdep(
++	ffi_cif*	cif);
++
++/*	Extended cif, used in callback from assembly routine */
++typedef struct	extended_cif {
++/*@dependent@*/	ffi_cif*	cif;
++/*@dependent@*/	void*		rvalue;
++/*@dependent@*/	void**		avalue;
+ } extended_cif;
+ 
+-/* Terse sized type definitions.  */
+-#if defined(_MSC_VER) || defined(__sgi) || defined(__SUNPRO_C)
+-typedef unsigned char UINT8;
+-typedef signed char   SINT8;
+-typedef unsigned short UINT16;
+-typedef signed short   SINT16;
+-typedef unsigned int UINT32;
+-typedef signed int   SINT32;
+-# ifdef _MSC_VER
+-typedef unsigned __int64 UINT64;
+-typedef signed __int64   SINT64;
+-# else
+-# include <inttypes.h>
+-typedef uint64_t UINT64;
+-typedef int64_t  SINT64;
+-# endif
+-#else
+-typedef unsigned int UINT8  __attribute__((__mode__(__QI__)));
+-typedef signed int   SINT8  __attribute__((__mode__(__QI__)));
+-typedef unsigned int UINT16 __attribute__((__mode__(__HI__)));
+-typedef signed int   SINT16 __attribute__((__mode__(__HI__)));
+-typedef unsigned int UINT32 __attribute__((__mode__(__SI__)));
+-typedef signed int   SINT32 __attribute__((__mode__(__SI__)));
+-typedef unsigned int UINT64 __attribute__((__mode__(__DI__)));
+-typedef signed int   SINT64 __attribute__((__mode__(__DI__)));
+-#endif
+-
+-typedef float FLOAT32;
+-
+-#ifndef __GNUC__
+-#define __builtin_expect(x, expected_value) (x)
+-#endif
+-#define LIKELY(x)    __builtin_expect(!!(x),1)
+-#define UNLIKELY(x)  __builtin_expect((x)!=0,0)
++/*	Terse sized type definitions.  */
++typedef unsigned int	UINT8	__attribute__((__mode__(__QI__)));
++typedef signed int		SINT8	__attribute__((__mode__(__QI__)));
++typedef unsigned int	UINT16	__attribute__((__mode__(__HI__)));
++typedef signed int		SINT16	__attribute__((__mode__(__HI__)));
++typedef unsigned int	UINT32	__attribute__((__mode__(__SI__)));
++typedef signed int		SINT32	__attribute__((__mode__(__SI__)));
++typedef unsigned int	UINT64	__attribute__((__mode__(__DI__)));
++typedef signed int		SINT64	__attribute__((__mode__(__DI__)));
++typedef float			FLOAT32;
+ 
+ #ifdef __cplusplus
+ }
+ #endif
+ 
+-#endif
++#endif	// #ifndef FFI_COMMON_H
+diff -uNr '--exclude=.git' libffi/meson.build subprojects/libffi/meson.build
+--- libffi/meson.build	2025-08-06 03:13:04 -0400
++++ subprojects/libffi/meson.build	2025-08-06 03:11:13 -0400
+@@ -253,8 +253,16 @@
    TARGET = 'RISCV'
    c_sources = ['ffi.c']
    asm_sources = ['sysv.S']
@@ -19,11 +223,10 @@ index ae7d0aa..baf6133 100644
  if TARGET == ''
    error('Unsupported pair: system "@0@", cpu family "@1@"'.format(host_system, host_cpu_family))
  endif
-diff --git a/src/meson.build b/src/meson.build
-index 1ac3b26..a87dad8 100644
---- a/src/meson.build
-+++ b/src/meson.build
-@@ -68,6 +68,18 @@ if is_msvc_like
+diff -uNr '--exclude=.git' libffi/src/meson.build subprojects/libffi/src/meson.build
+--- libffi/src/meson.build	2025-08-06 03:13:04 -0400
++++ subprojects/libffi/src/meson.build	2025-08-06 03:11:13 -0400
+@@ -68,6 +68,18 @@
    ffi_asm_sources = ffi_asm_objs
  endif
  
@@ -42,11 +245,9 @@ index 1ac3b26..a87dad8 100644
  ffi_link_args = []
  
  if get_option('ffi-build-versioned') and cc.has_argument('-x assembler-with-cpp')
-diff --git a/src/zos/ffi.c b/src/zos/ffi.c
-new file mode 100644
-index 0000000..d71e6a1
---- /dev/null
-+++ b/src/zos/ffi.c
+diff -uNr '--exclude=.git' libffi/src/zos/ffi.c subprojects/libffi/src/zos/ffi.c
+--- libffi/src/zos/ffi.c	1969-12-31 19:00:00 
++++ subprojects/libffi/src/zos/ffi.c	2025-08-06 03:11:13 -0400
 @@ -0,0 +1,1550 @@
 +/* -----------------------------------------------------------------------
 +   ffi.c - Copyright (c) 2000, 2007 Software AG
@@ -1598,11 +1799,9 @@ index 0000000..d71e6a1
 +}
 +
 +#endif
-diff --git a/src/zos/ffi.h b/src/zos/ffi.h
-new file mode 100644
-index 0000000..c2c9f6a
---- /dev/null
-+++ b/src/zos/ffi.h
+diff -uNr '--exclude=.git' libffi/src/zos/ffi.h subprojects/libffi/src/zos/ffi.h
+--- libffi/src/zos/ffi.h	1969-12-31 19:00:00 
++++ subprojects/libffi/src/zos/ffi.h	2025-08-06 03:11:13 -0400
 @@ -0,0 +1,294 @@
 +/*Licensed Materials - Property of IBM
 +IBM Open Enterprise SDK for Python 3.11
@@ -1898,100 +2097,9 @@ index 0000000..c2c9f6a
 +#endif
 +
 +#endif
-diff --git a/src/zos/ffi_common.h b/src/zos/ffi_common.h
-new file mode 100644
-index 0000000..18f3d45
---- /dev/null
-+++ b/src/zos/ffi_common.h
-@@ -0,0 +1,83 @@
-+/*Licensed Materials - Property of IBM
-+IBM Open Enterprise SDK for Python 3.11
-+5655-PYT
-+Copyright IBM Corp. 2022.
-+US Government Users Restricted Rights - Use, duplication or disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
-+*/
-+
-+/* -----------------------------------------------------------------------
-+   ffi_common.h - Copyright (c) 1996  Red Hat, Inc.
-+
-+   Common internal definitions and macros. Only necessary for building
-+   libffi.
-+   ----------------------------------------------------------------------- */
-+
-+#ifndef FFI_COMMON_H
-+#define FFI_COMMON_H
-+
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+
-+#include "fficonfig.h"
-+
-+/* to include alloca on Z we need stdlib */
-+#include <stdlib.h>
-+
-+#include <string.h>
-+
-+#ifdef FFI_DEBUG
-+#include <stdio.h>
-+
-+/*@exits@*/ void
-+ffi_assert(
-+/*@temp@*/	char*	expr,
-+/*@temp@*/	char*	file,
-+			int		line);
-+void
-+ffi_stop_here(void);
-+void
-+ffi_type_test(
-+/*@temp@*/ /*@out@*/	ffi_type*	a,
-+/*@temp@*/				char*	file,
-+						int		line);
-+
-+#	define FFI_ASSERT(x)			((x) ? (void)0 : ffi_assert(#x, __FILE__,__LINE__))
-+#	define FFI_ASSERT_AT(x, f, l)	((x) ? 0 : ffi_assert(#x, (f), (l)))
-+#	define FFI_ASSERT_VALID_TYPE(x)	ffi_type_test(x, __FILE__, __LINE__)
-+#else
-+#	define FFI_ASSERT(x) 
-+#	define FFI_ASSERT_AT(x, f, l)
-+#	define FFI_ASSERT_VALID_TYPE(x)
-+#endif	// #ifdef FFI_DEBUG
-+
-+#define ALIGN(v, a)	(((size_t)(v) + (a) - 1) & ~((a) - 1))
-+
-+/*	Perform machine dependent cif processing */
-+ffi_status
-+ffi_prep_cif_machdep(
-+	ffi_cif*	cif);
-+
-+/*	Extended cif, used in callback from assembly routine */
-+typedef struct	extended_cif {
-+/*@dependent@*/	ffi_cif*	cif;
-+/*@dependent@*/	void*		rvalue;
-+/*@dependent@*/	void**		avalue;
-+} extended_cif;
-+
-+/*	Terse sized type definitions.  */
-+typedef unsigned int	UINT8	__attribute__((__mode__(__QI__)));
-+typedef signed int		SINT8	__attribute__((__mode__(__QI__)));
-+typedef unsigned int	UINT16	__attribute__((__mode__(__HI__)));
-+typedef signed int		SINT16	__attribute__((__mode__(__HI__)));
-+typedef unsigned int	UINT32	__attribute__((__mode__(__SI__)));
-+typedef signed int		SINT32	__attribute__((__mode__(__SI__)));
-+typedef unsigned int	UINT64	__attribute__((__mode__(__DI__)));
-+typedef signed int		SINT64	__attribute__((__mode__(__DI__)));
-+typedef float			FLOAT32;
-+
-+#ifdef __cplusplus
-+}
-+#endif
-+
-+#endif	// #ifndef FFI_COMMON_H
-diff --git a/src/zos/ffitarget.h b/src/zos/ffitarget.h
-new file mode 100644
-index 0000000..4477260
---- /dev/null
-+++ b/src/zos/ffitarget.h
+diff -uNr '--exclude=.git' libffi/src/zos/ffitarget.h subprojects/libffi/src/zos/ffitarget.h
+--- libffi/src/zos/ffitarget.h	1969-12-31 19:00:00 
++++ subprojects/libffi/src/zos/ffitarget.h	2025-08-06 03:11:13 -0400
 @@ -0,0 +1,72 @@
 +/*Licensed Materials - Property of IBM
 +IBM Open Enterprise SDK for Python 3.11
@@ -2065,11 +2173,9 @@ index 0000000..4477260
 +
 +
 +#define UNLIKELY(x) x
-diff --git a/src/zos/types.c b/src/zos/types.c
-new file mode 100644
-index 0000000..2d6d478
---- /dev/null
-+++ b/src/zos/types.c
+diff -uNr '--exclude=.git' libffi/src/zos/types.c subprojects/libffi/src/zos/types.c
+--- libffi/src/zos/types.c	1969-12-31 19:00:00 
++++ subprojects/libffi/src/zos/types.c	2025-08-06 03:11:13 -0400
 @@ -0,0 +1,107 @@
 +#include "copyright.h"
 +/* -----------------------------------------------------------------------
@@ -2178,11 +2284,9 @@ index 0000000..2d6d478
 +FFI_COMPLEX_TYPEDEF(longdouble, long double, FFI_LDBL_CONST);
 +#endif
 +#endif
-diff --git a/src/zos/xplink.s b/src/zos/xplink.s
-new file mode 100644
-index 0000000..081959f
---- /dev/null
-+++ b/src/zos/xplink.s
+diff -uNr '--exclude=.git' libffi/src/zos/xplink.s subprojects/libffi/src/zos/xplink.s
+--- libffi/src/zos/xplink.s	1969-12-31 19:00:00 
++++ subprojects/libffi/src/zos/xplink.s	2025-08-06 03:11:13 -0400
 @@ -0,0 +1,596 @@
 +         ACONTROL AFPR,FLAG(CONT)
 +

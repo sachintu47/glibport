@@ -312,6 +312,19 @@ index 20a22aa..50cf981 100644
  
  gioenumtypes_dep = declare_dependency(sources : [gioenumtypes_h, glib_enumtypes_h, gio_visibility_h])
  
+diff --git a/glib/glib-private.h b/glib/glib-private.h
+index 94ea7e8..17cbf33 100644
+--- a/glib/glib-private.h
++++ b/glib/glib-private.h
+@@ -64,7 +64,7 @@
+  * as we'd like: https://stackoverflow.com/a/11529277/210151 and
+  * https://devblogs.microsoft.com/oldnewthing/20200731-00/?p=104024
+  */
+-#elif defined (G_OS_UNIX) && !defined (__APPLE__) && !defined(__CYGWIN__) && !defined(_AIX) && \
++#elif defined (G_OS_UNIX) && !defined (__APPLE__) && !defined(__CYGWIN__) && !defined(_AIX) && !defined(__MVS__) && \
+       g_macro__has_attribute (weak)
+ 
+ #define HAS_DYNAMIC_ASAN_LOADING
 diff --git a/glib/gutils.c b/glib/gutils.c
 index 9c0fbdf..ff1fd9f 100644
 --- a/glib/gutils.c
@@ -381,14 +394,14 @@ index ba401be..2168bb6 100644
  # In the 2.85 cycle, this soft-dependency on C11 will become a hard dependency.
  # If this is a problem on your toolchain or platform, please file an issue
 diff --git a/subprojects/libffi.wrap b/subprojects/libffi.wrap
-index a8a23bb..c67a9e8 100644
+index a8a23bb..65bb85d 100644
 --- a/subprojects/libffi.wrap
 +++ b/subprojects/libffi.wrap
 @@ -3,6 +3,7 @@ directory=libffi
  url=https://gitlab.freedesktop.org/gstreamer/meson-ports/libffi.git
  revision=meson
  depth=1
-+patch_directory=libffi-patches
++diff_files=libffi-patches/zos.patch
  
  [provide]
  libffi = ffi_dep
