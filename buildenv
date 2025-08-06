@@ -49,7 +49,7 @@ export ZOPEN_MAKE="meson_build"      ## Build program to run (defaults to 'make'
 
 meson_configure()
 {
-  MESON_FORCE_BACKTRACE=1 meson setup --default-library=static ../build --reconfigure -Dc_std=gnu11 -Dxattr=false -Dselinux=disabled
+  MESON_FORCE_BACKTRACE=1 meson setup --default-library=static ../build --reconfigure -Dc_std=gnu11 -Dxattr=false -Dselinux=disabled -Db_sanitize=none -Dtests=false
 }
 
 meson_build()

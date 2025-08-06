@@ -11,6 +11,72 @@ index 78db55b..8f32d6c 100644
  /**
   * GApplicationCommandLine:
   *
+diff --git a/gio/gio-tool-mount.c b/gio/gio-tool-mount.c
+index 6838775..8930b6c 100644
+--- a/gio/gio-tool-mount.c
++++ b/gio/gio-tool-mount.c
+@@ -367,7 +367,7 @@ new_mount_op (void)
+ 
+ 
+ static void
+-mount (GFile *file)
++mount_glib (GFile *file)
+ {
+   GMountOperation *op;
+ 
+@@ -1278,7 +1278,7 @@ handle_mount (int argc, char *argv[], gboolean do_help)
+           else if (mount_eject)
+             eject (file);
+           else
+-            mount (file);
++            mount_glib (file);
+           g_object_unref (file);
+         }
+     }
+diff --git a/gio/glocalfile.c b/gio/glocalfile.c
+index 8b08050..1bdc4a0 100644
+--- a/gio/glocalfile.c
++++ b/gio/glocalfile.c
+@@ -101,6 +101,7 @@
+ #endif
+ #endif
+ 
++#include <dirent.h>
+ 
+ static void g_local_file_file_iface_init (GFileIface *iface);
+ 
+@@ -236,6 +237,31 @@ _g_local_file_new (const char *filename)
+   return G_FILE (local);
+ }
+ 
++static  DIR *fdopendir(int fd)
++{
++        DIR *dir;
++        struct stat st;
++
++        if (fstat(fd, &st) < 0) {
++                return 0;
++        }
++        if (fcntl(fd, F_GETFL) & O_PATH) {
++                errno = EBADF;
++                return 0;
++        }
++        if (!S_ISDIR(st.st_mode)) {
++                errno = ENOTDIR;
++                return 0;
++        }
++        if (!(dir = calloc(1, sizeof *dir))) {
++                return 0;
++        }
++
++        fcntl(fd, F_SETFD, FD_CLOEXEC);
++        dir->dd_fd = fd;
++        return dir;
++}
++
+ /*< internal >
+  * g_local_file_new_from_dirname_and_basename:
+  * @dirname: an absolute, canonical directory name
 diff --git a/gio/glocalfileinfo.c b/gio/glocalfileinfo.c
 index 8d7831f..c24d58a 100644
 --- a/gio/glocalfileinfo.c
@@ -24,6 +90,19 @@ index 8d7831f..c24d58a 100644
        gecos = pwbufp->pw_gecos;
  
        if (gecos)
+diff --git a/gio/gmemorymonitorbase.c b/gio/gmemorymonitorbase.c
+index c84ade0..fdb0fe7 100644
+--- a/gio/gmemorymonitorbase.c
++++ b/gio/gmemorymonitorbase.c
+@@ -29,6 +29,8 @@
+ #include "gmemorymonitor.h"
+ #include "gmemorymonitorbase.h"
+ 
++#undef HAVE_SYSINFO
++
+ #ifdef HAVE_SYSINFO
+ #include <sys/sysinfo.h>
+ #endif
 diff --git a/gio/gresolver.c b/gio/gresolver.c
 index 60fbb4b..2e427a8 100644
 --- a/gio/gresolver.c
@@ -50,18 +129,158 @@ index 0a2a523..7719d4a 100644
   * GSocket:
   *
 diff --git a/gio/gthreadedresolver.c b/gio/gthreadedresolver.c
-index 988015b..357dc82 100644
+index 988015b..ec45877 100644
 --- a/gio/gthreadedresolver.c
 +++ b/gio/gthreadedresolver.c
 @@ -41,6 +41,8 @@
  #include "gsocketaddress.h"
  #include "gsrvtarget.h"
  
-+#define HAVE_GETIFADDRS 0
++#undef HAVE_GETIFADDRS
 +
  #if HAVE_GETIFADDRS
  #include <ifaddrs.h>
  #endif
+diff --git a/gio/gunixmounts.c b/gio/gunixmounts.c
+index 009d685..9c70299 100644
+--- a/gio/gunixmounts.c
++++ b/gio/gunixmounts.c
+@@ -549,7 +549,65 @@ create_unix_mount_point (const char *device_path,
+ }
+ 
+ /* mntent.h (Linux, GNU, NSS) {{{2 */
+-#ifdef HAVE_MNTENT_H
++#ifdef __MVS__
++
++static char *
++get_mtab_monitor_file (void)
++{
++  /* TODO: Not implemented */
++  return NULL;
++}
++
++static GUnixMountEntry **
++_g_unix_mounts_get_from_file (const char *table_path,
++                              uint64_t   *time_read_out,
++                              size_t     *n_entries_out)
++{
++  /* Not implemented, as per _g_get_unix_mounts() below */
++  if (time_read_out != NULL)
++    *time_read_out = 0;
++  if (n_entries_out != NULL)
++    *n_entries_out = 0;
++
++  return NULL;
++}
++
++static GList *
++_g_get_unix_mounts (void)
++{
++  struct statfs *mntent = NULL;
++  size_t bufsize;
++  int num_mounts, i;
++  GUnixMountEntry *mount_entry;
++  GList *return_list;
++  
++  num_mounts = getmntinfo(&mntent, MNT_NOWAIT);
++  if (num_mounts == -1)
++    return NULL;
++
++  return_list = NULL;
++  
++  for (i = 0; i < num_mounts; i++)
++    {
++      gboolean is_read_only = FALSE;
++
++      if (mntent[i].f_flags & MNT_RDONLY)
++        is_read_only = TRUE;
++
++      mount_entry = create_unix_mount_entry (mntent[i].f_mntfromname,
++                                             mntent[i].f_mntonname,
++                                             NULL,
++                                             mntent[i].f_fstypename,
++                                             NULL,
++                                             is_read_only);
++
++      return_list = g_list_prepend (return_list, mount_entry);
++    }
++  free(mntent);
++  return g_list_reverse (return_list);
++}
++
++#elif HAVE_MNTENT_H
+ 
+ #ifdef HAVE_LIBMOUNT
+ 
+@@ -1176,7 +1234,57 @@ get_fstab_file (void)
+ }
+ 
+ /* mntent.h (Linux, GNU, NSS) {{{2 */
+-#ifdef HAVE_MNTENT_H
++#ifdef __MVS__
++
++static GList *
++_g_get_unix_mount_points (void)
++{
++  struct statfs *mntent = NULL;
++  size_t bufsize;
++  int num_mounts, i;
++  GUnixMountPoint *mount_point = NULL;
++  GList *return_list;
++
++  num_mounts = getmntinfo(&mntent, MNT_NOWAIT);
++  if (num_mounts == -1)
++    return NULL;
++
++  return_list = NULL;
++
++  for (i = 0; i < num_mounts; i++)
++    {
++      gboolean is_read_only = FALSE;
++
++      if (mntent[i].f_flags & MNT_RDONLY)
++        is_read_only = TRUE;
++
++            mount_point = create_unix_mount_point (mntent[i].f_mntfromname,
++                                             mntent[i].f_mntonname,
++                                             mntent[i].f_fstypename,
++                                             NULL,
++                                             is_read_only,
++                                             FALSE,
++                                             FALSE);
++
++      return_list = g_list_prepend (return_list, mount_point);
++    }
++  free(mntent);
++  return g_list_reverse (return_list);
++}
++
++static GUnixMountPoint **
++_g_unix_mount_points_get_from_file (const char *table_path,
++                                    uint64_t   *time_read_out,
++                                    size_t     *n_points_out)
++{
++  if (time_read_out != NULL)
++    *time_read_out = 0;
++  if (n_points_out != NULL)
++    *n_points_out = 0;
++  return NULL;
++}
++
++#elif HAVE_MNTENT_H
+ 
+ #ifdef HAVE_LIBMOUNT
+ 
+@@ -3834,8 +3942,7 @@ g_unix_mount_point_guess_can_eject (GUnixMountPoint *mount_point)
+ }
+ 
+ /* Utility functions {{{1 */
+-
+-#ifdef HAVE_MNTENT_H
++#if defined(HAVE_MNTENT_H) && !defined(__MVS__)
+ /* borrowed from gtk/gtkfilesystemunix.c in GTK on 02/23/2006 */
+ static void
+ _canonicalize_filename (gchar *filename)
 diff --git a/gio/meson.build b/gio/meson.build
 index 20a22aa..50cf981 100644
 --- a/gio/meson.build
