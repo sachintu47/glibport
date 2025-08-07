@@ -27,7 +27,7 @@ export ZOPEN_DEV_DEPS=""  # Specify the dev build dependencies
 export ZOPEN_CATEGORIES="library"
 
 ## Runtime zopen tool dependencies to be installed alongside the tool.
-export ZOPEN_RUNTIME_DEPS=""
+export ZOPEN_RUNTIME_DEPS="libpcre2 zlib"
 
 ## Runtime system prerequisites; supply the name of the system pre-requisties.
 ## Current available prerequisites: zos24 zos25 zos31 procfs (see https://github.com/zopencommunity/meta/blob/main/include/prereq.sh for a current list)
@@ -101,10 +101,18 @@ zopen_get_version()
 ### Optional user-supplied functions for zopen-build
 ###
 
-#zopen_append_to_env() {
+zopen_append_to_env() {
   ## This function runs as part of generation of the .env file. The output of the
   ## function is appended to .env.
-#}
+cat <<ZZ
+if [ ! -z "\$ZOPEN_IN_ZOPEN_BUILD" ]; then
+  export ZOPEN_EXTRA_CFLAGS="\${ZOPEN_EXTRA_CFLAGS} -I\$PWD/include -I\$PWD/include/gio-unix-2.0 -I\$PWD/include/glib-2.0/include"
+  export ZOPEN_EXTRA_CXXFLAGS="\${ZOPEN_EXTRA_CXXFLAGS} -I\$PWD/include"
+  export ZOPEN_EXTRA_LDFLAGS="\${ZOPEN_EXTRA_LDFLAGS} -L\$PWD/lib"
+  export ZOPEN_EXTRA_LIBS="\${ZOPEN_EXTRA_LIBS} -lgio-2.0 -lgirepository-2.0 -lglib-2.0 -lgmodule-2.0 -lgobject-2.0 -lgthread-2.0 -lffi -lintl"
+fi
+ZZ
+}
 
 #zopen_append_to_setup(){
   ## This function runs as part of generation of the setup.sh file. The output of
