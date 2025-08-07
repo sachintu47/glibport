@@ -16,9 +16,7 @@ export ZOPEN_BUILD_LINE="STABLE"
 
 ## Required IF ZOPEN_BUILD_LINE='STABLE'
 export ZOPEN_STABLE_URL="https://github.com/GNOME/glib.git"
-export ZOPEN_STABLE_DEPS="zoslib make meson ninja pkgconfig check_python libpcre2 zlib coreutils patch libxml2" # Specify the stable build dependencies.
-
-export ZOPEN_CONFIGURE="meson_configure"
+export ZOPEN_STABLE_DEPS="zoslib make meson ninja pkgconfig check_python libpcre2 zlib coreutils patch libxml2 grep gawk" # Specify the stable build dependencies.
 
 ## Required IF ZOPEN_BUILD_LINE='DEV'
 export ZOPEN_DEV_URL=""   # Specify the dev build URL
@@ -41,15 +39,15 @@ export ZOPEN_SYSTEM_PREREQ=""
 ###
 
 #export ZOPEN_BOOTSTRAP="skip" ## Bootstrap program to run (defaults to './bootstrap')
-#export ZOPEN_CHECK="skip"     ## Check program to run (defaults to 'make')
-#export ZOPEN_CONFIGURE="skip" ## Configuration program to run (defaults to './configure')
-#export ZOPEN_INSTALL="skip"   ## Installation program to run (defaults to 'make')
+export ZOPEN_CHECK="meson_check"     ## Check program to run (defaults to 'make')
+export ZOPEN_CONFIGURE="meson_configure" ## Configuration program to run (defaults to './configure')
+export ZOPEN_INSTALL="meson_install"   ## Installation program to run (defaults to 'make')
 export ZOPEN_MAKE="meson_build"      ## Build program to run (defaults to 'make')
 #export ZOPEN_CLEAN=""         ## Clean up program to run (defaults to 'make')
 
 meson_configure()
 {
-  MESON_FORCE_BACKTRACE=1 meson setup --default-library=static ../build --reconfigure -Dc_std=gnu11 -Dxattr=false -Dselinux=disabled
+  MESON_FORCE_BACKTRACE=1 meson setup --prefix=${ZOPEN_INSTALL_DIR} --default-library=static ../build --reconfigure -Dc_std=gnu11 -Dxattr=false -Dselinux=disabled -Dbuildtype=release -Ddebug=false
 }
 
 meson_build()
@@ -57,6 +55,15 @@ meson_build()
   meson compile -C ../build
 }
 
+meson_check()
+{
+  meson test -C ../build
+}
+
+meson_install()
+{
+  meson install -C ../build
+}
 
 ###
 ### Required user-supplied functions
@@ -68,18 +75,25 @@ zopen_check_results()
   pfx="$2"
   chk="$1/$2_check.log"
 
-  # Echo the following information to gauge build health
-  echo "actualFailures:0"
-  echo "totalTests:1"
-  echo "expectedFailures:0"
-  echo "expectedTotalTests:1"
+  passed=$(grep '^Ok:' $chk | awk '{print $2}')
+  failed=$(grep '^Fail:' $chk | awk '{print $2}')
+  timeout=$(grep '^Timeout:' $chk | awk '{print $2}')
+
+  total_failed=$((failed + timeout))
+  totalTests=$((total_failed + passed))
+
+  echo "actualFailures:$total_failed"
+  echo "totalTests:$totalTests"
+  echo "expectedFailures:40"
+  echo "expectedTotalTests:333"
+
 }
 
 zopen_get_version()
 {
   # Modify to echo the version of your tool/library
   # Rather than hardcoding the version, obtain the version by running the tool/library
-  echo "1.0.0"
+  ../build/gio/gapplication version
 }
 
 
@@ -164,7 +178,7 @@ export ZOPEN_EXTRA_CPPFLAGS="-D__XPLAT=1 -D_POSIX_C_SOURCE=200809L -DO_CLOEXEC=0
 #export ZOPEN_EXTRA_LDFLAGS="" ## C,C++ linker flags to append to LDFLAGS (defaults to '')
 #export ZOPEN_EXTRA_LIBS="" ## C,C++ libraries to append to LIBS (defaults to '')
 #export ZOPEN_BOOTSTRAP_OPTS="" ## Options to pass to bootstrap program (defaults to '')
-#export ZOPEN_CHECK_MINIMAL="" ## Check program will not be passed CFLAGS, LDFLAGS, CPPFLAGS options but will get them from env vars.
+export ZOPEN_CHECK_MINIMAL="y" ## Check program will not be passed CFLAGS, LDFLAGS, CPPFLAGS options but will get them from env vars.
 #export ZOPEN_CHECK_OPTS="" ## Options to pass to check program (defaults to 'check')
 #export ZOPEN_CHECK_TIMEOUT="" ## Timeout limit in seconds for the check program (defaults to '12600' # 3.5 hours)
 #export ZOPEN_CLEAN_OPTS="" ## Options to pass to clean up  program (defaults to 'clean')
