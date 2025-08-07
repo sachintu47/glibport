@@ -91,7 +91,7 @@ index 8d7831f..c24d58a 100644
  
        if (gecos)
 diff --git a/gio/gmemorymonitorbase.c b/gio/gmemorymonitorbase.c
-index c84ade0..fdb0fe7 100644
+index ce28ebe..fd14244 100644
 --- a/gio/gmemorymonitorbase.c
 +++ b/gio/gmemorymonitorbase.c
 @@ -29,6 +29,8 @@
@@ -116,7 +116,7 @@ index 60fbb4b..2e427a8 100644
  /**
   * GResolver:
 diff --git a/gio/gsocket.c b/gio/gsocket.c
-index 0a2a523..7719d4a 100644
+index 44e9352..8d3d953 100644
 --- a/gio/gsocket.c
 +++ b/gio/gsocket.c
 @@ -82,6 +82,8 @@
@@ -312,6 +312,32 @@ index 20a22aa..50cf981 100644
  
  gioenumtypes_dep = declare_dependency(sources : [gioenumtypes_h, glib_enumtypes_h, gio_visibility_h])
  
+diff --git a/gio/tests/gsubprocess-testprog.c b/gio/tests/gsubprocess-testprog.c
+index b61ccc2..a7063b2 100644
+--- a/gio/tests/gsubprocess-testprog.c
++++ b/gio/tests/gsubprocess-testprog.c
+@@ -124,7 +124,7 @@ sleep_forever_mode (int argc,
+   return 0;
+ }
+ 
+-#ifdef G_OS_UNIX
++#if defined(G_OS_UNIX) && !defined(__MVS__)
+ #define GLIB_FD_CLOEXEC "e"
+ #else
+ #define GLIB_FD_CLOEXEC ""
+diff --git a/glib/gfileutils.c b/glib/gfileutils.c
+index 0855ebe..7d77ba5 100644
+--- a/glib/gfileutils.c
++++ b/glib/gfileutils.c
+@@ -938,7 +938,7 @@ get_contents_posix (const gchar  *filename,
+       FILE *f;
+       gboolean retval;
+ 
+-      f = fdopen (fd, "re");
++      f = fdopen (fd, "r");
+       
+       if (f == NULL)
+         {
 diff --git a/glib/glib-private.h b/glib/glib-private.h
 index 94ea7e8..17cbf33 100644
 --- a/glib/glib-private.h
@@ -338,6 +364,31 @@ index 9c0fbdf..ff1fd9f 100644
              if (pw->pw_gecos && *pw->pw_gecos != '\0' && pw->pw_name)
                {
                  gchar **gecos_fields;
+diff --git a/glib/tests/include.c b/glib/tests/include.c
+index 1325266..29418ab 100644
+--- a/glib/tests/include.c
++++ b/glib/tests/include.c
+@@ -1,6 +1,6 @@
+ /* Test case for bug 659866 */
+ 
+-#define _POSIX_C_SOURCE 199309L
++//#define _POSIX_C_SOURCE 199309L
+ #undef _GNU_SOURCE
+ #undef _XOPEN_SOURCE
+ #include <pthread.h>
+diff --git a/glib/tests/thread.c b/glib/tests/thread.c
+index ba34485..62bf02b 100644
+--- a/glib/tests/thread.c
++++ b/glib/tests/thread.c
+@@ -138,7 +138,7 @@ test_thread4 (void)
+ {
+ #ifdef _GLIB_ADDRESS_SANITIZER
+   g_test_incomplete ("FIXME: Leaks a GSystemThread's name, see glib#2308");
+-#elif defined(HAVE_PRLIMIT)
++#elif defined(HAVE_PRLIMIT) && defined(RLIMIT_NPROC)
+   struct rlimit ol, nl;
+   GThread *thread;
+   GError *error;
 diff --git a/gobject/meson.build b/gobject/meson.build
 index 91823af..6470af2 100644
 --- a/gobject/meson.build
