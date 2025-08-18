@@ -1,0 +1,4 @@
+diff --git a/subprojects/libffi.wrap b/subprojects/libffi.wrap.disabled
+similarity index 100%
+rename from subprojects/libffi.wrap
+rename to subprojects/libffi.wrap.disabled

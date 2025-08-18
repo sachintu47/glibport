@@ -138,8 +138,7 @@ ZZ
 zopen_init(){
   ## This function runs after code is downloaded and patched but before the code
   ## is built.
-  mkdir -p subprojects/packagefiles
-  cp -rf ../libffi-patches/ subprojects/packagefiles/
+  cp -rf ../libffi_built/ subprojects/libffi
 }
 
 #zopen_post_buildenv(){
