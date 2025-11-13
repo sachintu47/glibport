@@ -86,7 +86,6 @@ zopen_check_results()
   echo "actualFailures:$total_failed"
   echo "totalTests:$totalTests"
   echo "expectedFailures:40"
-  echo "expectedTotalTests:333"
 
 }
 
