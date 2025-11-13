@@ -1,0 +1,13 @@
+diff --git a/gio/tests/gsubprocess-testprog.c b/gio/tests/gsubprocess-testprog.c
+index b61ccc2..a7063b2 100644
+--- a/gio/tests/gsubprocess-testprog.c
++++ b/gio/tests/gsubprocess-testprog.c
+@@ -124,7 +124,7 @@ sleep_forever_mode (int argc,
+   return 0;
+ }
+ 
+-#ifdef G_OS_UNIX
++#if defined(G_OS_UNIX) && !defined(__MVS__)
+ #define GLIB_FD_CLOEXEC "e"
+ #else
+ #define GLIB_FD_CLOEXEC ""
