@@ -1,5 +1,5 @@
 diff --git a/gio/gapplicationcommandline.c b/gio/gapplicationcommandline.c
-index 78db55b..8f32d6c 100644
+index ab123b0..53d11c3 100644
 --- a/gio/gapplicationcommandline.c
 +++ b/gio/gapplicationcommandline.c
 @@ -39,6 +39,8 @@
@@ -34,7 +34,7 @@ index 6838775..8930b6c 100644
          }
      }
 diff --git a/gio/glocalfile.c b/gio/glocalfile.c
-index 8b08050..1bdc4a0 100644
+index 8e20e70..49e60a6 100644
 --- a/gio/glocalfile.c
 +++ b/gio/glocalfile.c
 @@ -101,6 +101,7 @@
@@ -78,7 +78,7 @@ index 8b08050..1bdc4a0 100644
   * g_local_file_new_from_dirname_and_basename:
   * @dirname: an absolute, canonical directory name
 diff --git a/gio/glocalfileinfo.c b/gio/glocalfileinfo.c
-index 8d7831f..c24d58a 100644
+index 2c0ebde..f69dc0f 100644
 --- a/gio/glocalfileinfo.c
 +++ b/gio/glocalfileinfo.c
 @@ -1186,7 +1186,7 @@ lookup_uid_data (uid_t uid)
@@ -91,7 +91,7 @@ index 8d7831f..c24d58a 100644
  
        if (gecos)
 diff --git a/gio/gmemorymonitorbase.c b/gio/gmemorymonitorbase.c
-index ce28ebe..fd14244 100644
+index 56b083f..8deb32f 100644
 --- a/gio/gmemorymonitorbase.c
 +++ b/gio/gmemorymonitorbase.c
 @@ -29,6 +29,8 @@
@@ -102,7 +102,7 @@ index ce28ebe..fd14244 100644
 +
  #ifdef HAVE_SYSINFO
  #include <sys/sysinfo.h>
- #endif
+ #elif defined(HAVE_UNISTD_H)
 diff --git a/gio/gresolver.c b/gio/gresolver.c
 index 60fbb4b..2e427a8 100644
 --- a/gio/gresolver.c
@@ -116,7 +116,7 @@ index 60fbb4b..2e427a8 100644
  /**
   * GResolver:
 diff --git a/gio/gsocket.c b/gio/gsocket.c
-index 44e9352..8d3d953 100644
+index 0a2a523..7719d4a 100644
 --- a/gio/gsocket.c
 +++ b/gio/gsocket.c
 @@ -82,6 +82,8 @@
@@ -129,7 +129,7 @@ index 44e9352..8d3d953 100644
   * GSocket:
   *
 diff --git a/gio/gthreadedresolver.c b/gio/gthreadedresolver.c
-index 988015b..ec45877 100644
+index 78740b0..228a719 100644
 --- a/gio/gthreadedresolver.c
 +++ b/gio/gthreadedresolver.c
 @@ -41,6 +41,8 @@
@@ -142,7 +142,7 @@ index 988015b..ec45877 100644
  #include <ifaddrs.h>
  #endif
 diff --git a/gio/gunixmounts.c b/gio/gunixmounts.c
-index 009d685..9c70299 100644
+index 45a9389..eb1143d 100644
 --- a/gio/gunixmounts.c
 +++ b/gio/gunixmounts.c
 @@ -549,7 +549,65 @@ create_unix_mount_point (const char *device_path,
@@ -271,7 +271,7 @@ index 009d685..9c70299 100644
  
  #ifdef HAVE_LIBMOUNT
  
-@@ -3834,8 +3942,7 @@ g_unix_mount_point_guess_can_eject (GUnixMountPoint *mount_point)
+@@ -3835,8 +3943,7 @@ g_unix_mount_point_guess_can_eject (GUnixMountPoint *mount_point)
  }
  
  /* Utility functions {{{1 */
@@ -282,10 +282,10 @@ index 009d685..9c70299 100644
  static void
  _canonicalize_filename (gchar *filename)
 diff --git a/gio/meson.build b/gio/meson.build
-index 20a22aa..50cf981 100644
+index 201d293..adac5fc 100644
 --- a/gio/meson.build
 +++ b/gio/meson.build
-@@ -776,22 +776,22 @@ install_headers(gio_headers, install_dir : gio_includedir)
+@@ -785,22 +785,22 @@ install_headers(gio_headers, install_dir : gio_includedir)
  # in PATH, which means you can't bootstrap glib with its own glib-mkenums.
  gioenumtypes_h = custom_target('gioenumtypes_h',
    output : 'gioenumtypes.h',
@@ -311,145 +311,4 @@ index 20a22aa..50cf981 100644
 +             '--output', '@OUTPUT@', '@INPUT@', gnetworking_h])
  
  gioenumtypes_dep = declare_dependency(sources : [gioenumtypes_h, glib_enumtypes_h, gio_visibility_h])
- 
-diff --git a/gio/tests/gsubprocess-testprog.c b/gio/tests/gsubprocess-testprog.c
-index b61ccc2..a7063b2 100644
---- a/gio/tests/gsubprocess-testprog.c
-+++ b/gio/tests/gsubprocess-testprog.c
-@@ -124,7 +124,7 @@ sleep_forever_mode (int argc,
-   return 0;
- }
- 
--#ifdef G_OS_UNIX
-+#if defined(G_OS_UNIX) && !defined(__MVS__)
- #define GLIB_FD_CLOEXEC "e"
- #else
- #define GLIB_FD_CLOEXEC ""
-diff --git a/glib/gfileutils.c b/glib/gfileutils.c
-index 0855ebe..7d77ba5 100644
---- a/glib/gfileutils.c
-+++ b/glib/gfileutils.c
-@@ -938,7 +938,7 @@ get_contents_posix (const gchar  *filename,
-       FILE *f;
-       gboolean retval;
- 
--      f = fdopen (fd, "re");
-+      f = fdopen (fd, "r");
-       
-       if (f == NULL)
-         {
-diff --git a/glib/glib-private.h b/glib/glib-private.h
-index 94ea7e8..17cbf33 100644
---- a/glib/glib-private.h
-+++ b/glib/glib-private.h
-@@ -64,7 +64,7 @@
-  * as we'd like: https://stackoverflow.com/a/11529277/210151 and
-  * https://devblogs.microsoft.com/oldnewthing/20200731-00/?p=104024
-  */
--#elif defined (G_OS_UNIX) && !defined (__APPLE__) && !defined(__CYGWIN__) && !defined(_AIX) && \
-+#elif defined (G_OS_UNIX) && !defined (__APPLE__) && !defined(__CYGWIN__) && !defined(_AIX) && !defined(__MVS__) && \
-       g_macro__has_attribute (weak)
- 
- #define HAS_DYNAMIC_ASAN_LOADING
-diff --git a/glib/gutils.c b/glib/gutils.c
-index 9c0fbdf..ff1fd9f 100644
---- a/glib/gutils.c
-+++ b/glib/gutils.c
-@@ -734,7 +734,7 @@ g_get_user_database_entry (void)
-           {
-             e.user_name = g_strdup (pw->pw_name);
- 
--#ifndef __BIONIC__
-+#if !defined(__BIONIC__) && !defined(__MVS__)
-             if (pw->pw_gecos && *pw->pw_gecos != '\0' && pw->pw_name)
-               {
-                 gchar **gecos_fields;
-diff --git a/glib/tests/include.c b/glib/tests/include.c
-index 1325266..29418ab 100644
---- a/glib/tests/include.c
-+++ b/glib/tests/include.c
-@@ -1,6 +1,6 @@
- /* Test case for bug 659866 */
- 
--#define _POSIX_C_SOURCE 199309L
-+//#define _POSIX_C_SOURCE 199309L
- #undef _GNU_SOURCE
- #undef _XOPEN_SOURCE
- #include <pthread.h>
-diff --git a/glib/tests/thread.c b/glib/tests/thread.c
-index ba34485..62bf02b 100644
---- a/glib/tests/thread.c
-+++ b/glib/tests/thread.c
-@@ -138,7 +138,7 @@ test_thread4 (void)
- {
- #ifdef _GLIB_ADDRESS_SANITIZER
-   g_test_incomplete ("FIXME: Leaks a GSystemThread's name, see glib#2308");
--#elif defined(HAVE_PRLIMIT)
-+#elif defined(HAVE_PRLIMIT) && defined(RLIMIT_NPROC)
-   struct rlimit ol, nl;
-   GThread *thread;
-   GError *error;
-diff --git a/gobject/meson.build b/gobject/meson.build
-index 91823af..6470af2 100644
---- a/gobject/meson.build
-+++ b/gobject/meson.build
-@@ -116,23 +116,23 @@ glib_enumtypes_input_headers = files(
- 
- glib_enumtypes_h = custom_target('glib_enumtypes_h',
-   output : 'glib-enumtypes.h',
--  capture : true,
-+  capture : false,
-   input : glib_enumtypes_input_headers,
-   install : true,
-   install_dir : join_paths(get_option('includedir'), 'glib-2.0/gobject'),
-   install_tag: 'devel',
-   command : [python, glib_mkenums,
-              '--template', files('glib-enumtypes.h.template'),
--             '@INPUT@'])
-+             '--output', '@OUTPUT@', '@INPUT@'])
- 
- glib_enumtypes_c = custom_target('glib_enumtypes_c',
-   output : 'glib-enumtypes.c',
--  capture : true,
-+  capture : false,
-   input : glib_enumtypes_input_headers,
-   depends : [glib_enumtypes_h],
-   command : [python, glib_mkenums,
-              '--template', files('glib-enumtypes.c.template'),
--             '@INPUT@'])
-+             '--output', '@OUTPUT@', '@INPUT@'])
- 
- # Expose as variable to be used by gobject-introspection
- # when it includes GLib as a subproject
-diff --git a/meson.build b/meson.build
-index ba401be..3be93b9 100644
---- a/meson.build
-+++ b/meson.build
-@@ -18,12 +18,12 @@ fs = import('fs')
- cc = meson.get_compiler('c')
- c_standards = {}
- 
--foreach std : ['89', '99', '11', '17']
--  arg = (cc.get_id() == 'msvc' ? '/std:' : '-std=') + 'c' + std
--  if cc.has_argument(arg)
--    c_standards += { std: arg }
--  endif
--endforeach
-+#foreach std : ['89', '99', '11', '17']
-+#  arg = (cc.get_id() == 'msvc' ? '/std:' : '-std=') + 'c' + std
-+#  if cc.has_argument(arg)
-+#    c_standards += { std: arg }
-+#  endif
-+#endforeach
- 
- # In the 2.85 cycle, this soft-dependency on C11 will become a hard dependency.
- # If this is a problem on your toolchain or platform, please file an issue
-@@ -2285,7 +2285,7 @@ subproject('gvdb', default_options: {'tests': false})
- gvdb_dep = dependency('gvdb')
- 
- libm = cc.find_library('m', required : false)
--libffi_dep = dependency('libffi', version : '>= 3.0.0')
-+libffi_dep = dependency('libffi', fallback: ['libffi', 'libffi_dep'])
- 
- libz_dep = dependency('zlib')
  

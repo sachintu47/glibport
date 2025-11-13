@@ -1,0 +1,86 @@
+diff --git a/glib/tests/include.c b/glib/tests/include.c
+index 1325266..29418ab 100644
+--- a/glib/tests/include.c
++++ b/glib/tests/include.c
+@@ -1,6 +1,6 @@
+ /* Test case for bug 659866 */
+ 
+-#define _POSIX_C_SOURCE 199309L
++//#define _POSIX_C_SOURCE 199309L
+ #undef _GNU_SOURCE
+ #undef _XOPEN_SOURCE
+ #include <pthread.h>
+diff --git a/glib/tests/testing.c b/glib/tests/testing.c
+index fd541b0..7fa98e1 100644
+--- a/glib/tests/testing.c
++++ b/glib/tests/testing.c
+@@ -42,6 +42,31 @@
+ #include <unistd.h>
+ #endif
+ 
++#ifdef __MVS__
++static int dupfd_cloexec(int oldfd, int minfd) {
++    int newfd = fcntl(oldfd, F_DUPFD, minfd);
++    if (newfd == -1) {
++        perror("fcntl(F_DUPFD) failed");
++        return -1;
++    }
++
++    int flags = fcntl(newfd, F_GETFD);
++    if (flags == -1) {
++        perror("fcntl(F_GETFD) failed");
++        close(newfd);
++        return -1;
++    }
++
++    if (fcntl(newfd, F_SETFD, flags | FD_CLOEXEC) == -1) {
++        perror("fcntl(F_SETFD) failed");
++        close(newfd);
++        return -1;
++    }
++
++    return newfd;
++}
++#endif
++
+ #define TAP_VERSION G_STRINGIFY (14)
+ #define TAP_SUBTEST_PREFIX "    "
+ 
+@@ -453,7 +478,11 @@ test_subprocess_stdin (void)
+     }
+ 
+   /* Temporarily override this process’ stdin with a pipe. */
++#if !defined(__MVS__)
+   old_stdin_fd = fcntl (STDIN_FILENO, F_DUPFD_CLOEXEC, 0);
++#else
++  old_stdin_fd = dupfd_cloexec (STDIN_FILENO, 0);
++#endif
+   g_assert_cmpint (old_stdin_fd, >=, 0);
+ 
+   g_unix_open_pipe (pipe_fd, O_CLOEXEC, &local_error);
+diff --git a/glib/tests/thread-pool.c b/glib/tests/thread-pool.c
+index 7161078..85ddda2 100644
+--- a/glib/tests/thread-pool.c
++++ b/glib/tests/thread-pool.c
+@@ -47,7 +47,7 @@ pool_fail_func (gpointer data,
+ static void
+ test_pool_fail (void)
+ {
+-#ifdef HAVE_PRLIMIT
++#if defined(HAVE_PRLIMIT) && defined(RLIMIT_NPROC)
+   struct rlimit ol, nl;
+   GThread *thread;
+ 
+diff --git a/glib/tests/thread.c b/glib/tests/thread.c
+index ba34485..62bf02b 100644
+--- a/glib/tests/thread.c
++++ b/glib/tests/thread.c
+@@ -138,7 +138,7 @@ test_thread4 (void)
+ {
+ #ifdef _GLIB_ADDRESS_SANITIZER
+   g_test_incomplete ("FIXME: Leaks a GSystemThread's name, see glib#2308");
+-#elif defined(HAVE_PRLIMIT)
++#elif defined(HAVE_PRLIMIT) && defined(RLIMIT_NPROC)
+   struct rlimit ol, nl;
+   GThread *thread;
+   GError *error;
